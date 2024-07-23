@@ -1,6 +1,7 @@
 import requests
 import json
 import time
+from requests.exceptions import RequestException
 
 # Replace with your Etherscan API key
 ETHERSCAN_API_KEY = 'YOUR_API_KEY'
@@ -8,11 +9,18 @@ ETHERSCAN_API_KEY = 'YOUR_API_KEY'
 # Function to get the transactions of an Ethereum address
 def get_transactions(address, startblock=0, endblock=99999999, page=1, offset=10000, sort='asc'):
     url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock={startblock}&endblock={endblock}&page={page}&offset={offset}&sort={sort}&apikey={ETHERSCAN_API_KEY}"
-    response = requests.get(url)
-    data = response.json()
-    if data['status'] == '1':
-        return data['result']
-    else:
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        if data['status'] == '1':
+            return data['result']
+        else:
+            log_and_print(f"Error in response: {data['message']}", [])
+            return []
+    except RequestException as e:
+        log_and_print(f"Request failed: {str(e)}", [])
         return []
 
 # Function to find connection between two addresses
@@ -21,8 +29,8 @@ def find_connection(address1, address2, max_depth=3, current_depth=1, log=[]):
         return False
 
     log_and_print(f"Checking transactions of {address1} at depth {current_depth}", log)
-
     transactions = get_transactions(address1)
+
     log_and_print(f"Found {len(transactions)} transactions for {address1}", log)
     
     for tx in transactions:
@@ -30,9 +38,10 @@ def find_connection(address1, address2, max_depth=3, current_depth=1, log=[]):
         if tx['to'] == address2:
             log_and_print(f"Direct connection found in transaction {tx['hash']}", log)
             return True
-        elif find_connection(tx['to'], address2, max_depth, current_depth + 1, log):
+        elif tx['to'] and find_connection(tx['to'], address2, max_depth, current_depth + 1, log):
             log_and_print(f"Indirect connection found through {tx['to']}", log)
             return True
+
     return False
 
 # Function to log and print messages
