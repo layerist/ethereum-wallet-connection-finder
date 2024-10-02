@@ -33,10 +33,10 @@ def get_transactions(address, startblock=0, endblock=99999999, page=1, offset=10
             response.raise_for_status()  # Raise HTTPError for bad responses
             data = response.json()
 
-            if data['status'] == '1':  # Success
-                return data['result']
+            if data.get('status') == '1':  # Success
+                return data.get('result', [])
             else:  # API returned a failure message
-                log_and_print(f"API error: {data['message']}", [])
+                log_and_print(f"API error: {data.get('message')}", [])
                 return []
 
         except (RequestException, HTTPError, Timeout) as e:
