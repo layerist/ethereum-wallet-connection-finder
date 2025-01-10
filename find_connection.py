@@ -10,7 +10,6 @@ from typing import List, Optional
 # Retrieve Etherscan API key from environment variable or set a placeholder
 ETHERSCAN_API_KEY = os.getenv('ETHERSCAN_API_KEY', 'YOUR_API_KEY')
 
-# Cache transactions to minimize repeated API calls
 @lru_cache(maxsize=None)
 def get_transactions(
     address: str,
@@ -24,6 +23,7 @@ def get_transactions(
 ) -> List[dict]:
     """
     Fetch Ethereum transactions for a specified address from the Etherscan API.
+    Caches results to reduce repeated API calls.
     """
     url = (
         f"https://api.etherscan.io/api?module=account&action=txlist&address={address}"
