@@ -6,28 +6,26 @@ from requests.exceptions import RequestException, Timeout
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
-# Retrieve Etherscan API key from environment variable or set a placeholder
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "YOUR_API_KEY")
 
-
-def log_message(message: str, log: Optional[List[str]] = None, verbose: bool = True):
+def log_message(message: str, log: Optional[List[str]] = None, verbose: bool = True) -> None:
     """
-    Logs a message with a timestamp and optionally appends it to a list.
+    Logs a timestamped message to stdout and optionally stores it in a log list.
     """
-    timestamped_message = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    full_message = f"[{timestamp}] {message}"
     if verbose:
-        print(timestamped_message)
+        print(full_message)
     if log is not None:
-        log.append(timestamped_message)
+        log.append(full_message)
 
-
-@lru_cache(maxsize=500)
+@lru_cache(maxsize=1000)
 def get_transactions(address: str, retries: int = 3, initial_delay: int = 1) -> List[dict]:
     """
-    Fetch Ethereum transactions for a given address using the Etherscan API.
-    Implements caching and retry logic for robustness.
+    Retrieve transactions for a given Ethereum address using Etherscan API.
+    Implements retry logic with exponential backoff and caching.
     """
     url = (
         f"https://api.etherscan.io/api?module=account&action=txlist&address={address}"
@@ -43,77 +41,84 @@ def get_transactions(address: str, retries: int = 3, initial_delay: int = 1) -> 
 
             if data.get("status") == "1":
                 return data.get("result", [])
-            if data.get("status") == "0" and data.get("message") == "No transactions found":
+            elif data.get("message") == "No transactions found":
                 return []
-
-            log_message(f"API error ({address}): {data.get('message')}")
+            else:
+                log_message(f"Etherscan API error for {address}: {data.get('message')}")
         except (RequestException, Timeout) as e:
             log_message(f"Attempt {attempt}/{retries} failed for {address}: {e}")
-        
-        time.sleep(delay)
-        delay *= 2  # Exponential backoff
-    
+            time.sleep(delay)
+            delay *= 2  # Exponential backoff
+
     return []
 
-
-def find_connection(address1: str, address2: str, max_depth: int = 3, log: Optional[List[str]] = None) -> bool:
+def find_connection(
+    address1: str, 
+    address2: str, 
+    max_depth: int = 3, 
+    log: Optional[List[str]] = None
+) -> bool:
     """
-    Uses a breadth-first search (BFS) to find a transaction path between two Ethereum addresses.
+    Performs a BFS to find a transaction path from address1 to address2.
     """
-    queue = deque([(address1, 0)])
+    address1, address2 = address1.lower(), address2.lower()
     visited: Set[str] = set()
+    queue: deque[Tuple[str, int]] = deque([(address1, 0)])
 
     while queue:
         current_address, depth = queue.popleft()
-        if depth >= max_depth:
+        if depth >= max_depth or current_address in visited:
             continue
 
-        if current_address in visited:
-            continue
         visited.add(current_address)
-
-        log_message(f"Checking {current_address} at depth {depth}", log)
+        log_message(f"Exploring {current_address} at depth {depth}", log)
         transactions = get_transactions(current_address)
-        log_message(f"Found {len(transactions)} transactions for {current_address}", log)
+
+        log_message(f"→ Found {len(transactions)} transactions", log)
 
         for tx in transactions:
-            tx_to = tx.get("to", "").lower()
-            if not tx_to or tx_to in visited:
+            to_address = tx.get("to", "").lower()
+            if not to_address or to_address in visited:
                 continue
-            
-            log_message(f"Checking transaction {tx['hash']} → {tx_to}", log)
-            
-            if tx_to == address2.lower():
-                log_message(f"Direct connection found in transaction {tx['hash']}", log)
+
+            log_message(f"Checking tx {tx['hash']} → {to_address}", log)
+
+            if to_address == address2:
+                log_message(f"✔ Connection found via tx {tx['hash']}", log)
                 return True
-            
-            queue.append((tx_to, depth + 1))
-    
+
+            queue.append((to_address, depth + 1))
+
     return False
 
-
-def main(address1: str, address2: str, max_threads: int = 4, log_file: str = "connection_log.txt"):
+def main(
+    address1: str, 
+    address2: str, 
+    max_depth: int = 3,
+    max_threads: int = 4, 
+    log_file: str = "connection_log.txt",
+    verbose: bool = True
+) -> None:
     """
-    Main function to search for a connection between two Ethereum addresses.
-    Uses multithreading to parallelize API calls and improve performance.
+    Entry point for connection search between two Ethereum addresses.
     """
-    log = []
-    log_message(f"Starting connection search: {address1} → {address2}", log)
+    log: List[str] = []
+    log_message(f"Searching connection from {address1} to {address2}", log, verbose)
 
     with ThreadPoolExecutor(max_threads) as executor:
-        future = executor.submit(find_connection, address1, address2, log=log)
+        future = executor.submit(find_connection, address1, address2, max_depth, log)
         connection_found = future.result()
 
     if connection_found:
-        log_message("Connection found!", log)
+        log_message("🎉 Connection found!", log, verbose)
     else:
-        log_message("No connection found.", log)
+        log_message("❌ No connection found.", log, verbose)
 
-    with open(log_file, "w") as file:
-        file.write("\n".join(log))
-
+    with open(log_file, "w") as f:
+        f.write("\n".join(log))
 
 if __name__ == "__main__":
+    # Replace with real addresses or pass via command line
     address1 = "0xAddress1"
     address2 = "0xAddress2"
     main(address1, address2)
