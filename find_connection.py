@@ -2,17 +2,24 @@ import os
 import time
 import json
 import requests
+from requests import Session
 from requests.exceptions import RequestException, Timeout
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from typing import List, Optional, Set, Tuple
 
+# Constants
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "YOUR_API_KEY")
+ETHERSCAN_BASE_URL = "https://api.etherscan.io/api"
+REQUEST_TIMEOUT = 10
+
+# Use a session to reuse TCP connections
+session = Session()
 
 def log_message(message: str, log: Optional[List[str]] = None, verbose: bool = True) -> None:
     """
-    Logs a timestamped message to stdout and optionally stores it in a log list.
+    Print and/or store a timestamped log message.
     """
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     full_message = f"[{timestamp}] {message}"
@@ -22,20 +29,23 @@ def log_message(message: str, log: Optional[List[str]] = None, verbose: bool = T
         log.append(full_message)
 
 @lru_cache(maxsize=1000)
-def get_transactions(address: str, retries: int = 3, initial_delay: int = 1) -> List[dict]:
+def get_transactions(address: str, retries: int = 3, delay: int = 1) -> List[dict]:
     """
-    Retrieve transactions for a given Ethereum address using Etherscan API.
-    Implements retry logic with exponential backoff and caching.
+    Fetch transactions for a given Ethereum address with retry and caching.
     """
-    url = (
-        f"https://api.etherscan.io/api?module=account&action=txlist&address={address}"
-        f"&startblock=0&endblock=99999999&sort=asc&apikey={ETHERSCAN_API_KEY}"
-    )
+    params = {
+        "module": "account",
+        "action": "txlist",
+        "address": address,
+        "startblock": 0,
+        "endblock": 99999999,
+        "sort": "asc",
+        "apikey": ETHERSCAN_API_KEY
+    }
 
-    delay = initial_delay
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(url, timeout=10)
+            response = session.get(ETHERSCAN_BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
 
@@ -44,7 +54,7 @@ def get_transactions(address: str, retries: int = 3, initial_delay: int = 1) -> 
             elif data.get("message") == "No transactions found":
                 return []
             else:
-                log_message(f"Etherscan API error for {address}: {data.get('message')}")
+                log_message(f"Etherscan error for {address}: {data.get('message')}")
         except (RequestException, Timeout) as e:
             log_message(f"Attempt {attempt}/{retries} failed for {address}: {e}")
             time.sleep(delay)
@@ -53,13 +63,13 @@ def get_transactions(address: str, retries: int = 3, initial_delay: int = 1) -> 
     return []
 
 def find_connection(
-    address1: str, 
-    address2: str, 
-    max_depth: int = 3, 
+    address1: str,
+    address2: str,
+    max_depth: int = 3,
     log: Optional[List[str]] = None
 ) -> bool:
     """
-    Performs a BFS to find a transaction path from address1 to address2.
+    Use BFS to find a transaction path from address1 to address2.
     """
     address1, address2 = address1.lower(), address2.lower()
     visited: Set[str] = set()
@@ -72,8 +82,8 @@ def find_connection(
 
         visited.add(current_address)
         log_message(f"Exploring {current_address} at depth {depth}", log)
-        transactions = get_transactions(current_address)
 
+        transactions = get_transactions(current_address)
         log_message(f"→ Found {len(transactions)} transactions", log)
 
         for tx in transactions:
@@ -92,18 +102,18 @@ def find_connection(
     return False
 
 def main(
-    address1: str, 
-    address2: str, 
+    address1: str,
+    address2: str,
     max_depth: int = 3,
-    max_threads: int = 4, 
+    max_threads: int = 4,
     log_file: str = "connection_log.txt",
     verbose: bool = True
 ) -> None:
     """
-    Entry point for connection search between two Ethereum addresses.
+    Search for a transaction connection between two Ethereum addresses.
     """
     log: List[str] = []
-    log_message(f"Searching connection from {address1} to {address2}", log, verbose)
+    log_message(f"🔍 Searching connection from {address1} to {address2}", log, verbose)
 
     with ThreadPoolExecutor(max_threads) as executor:
         future = executor.submit(find_connection, address1, address2, max_depth, log)
@@ -118,7 +128,15 @@ def main(
         f.write("\n".join(log))
 
 if __name__ == "__main__":
-    # Replace with real addresses or pass via command line
-    address1 = "0xAddress1"
-    address2 = "0xAddress2"
-    main(address1, address2)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Find transaction connection between two Ethereum addresses.")
+    parser.add_argument("address1", help="Starting Ethereum address")
+    parser.add_argument("address2", help="Target Ethereum address")
+    parser.add_argument("--max-depth", type=int, default=3, help="Maximum search depth")
+    parser.add_argument("--max-threads", type=int, default=4, help="Maximum number of threads")
+    parser.add_argument("--log-file", default="connection_log.txt", help="Path to log file")
+    parser.add_argument("--quiet", action="store_true", help="Suppress console output")
+
+    args = parser.parse_args()
+    main(args.address1, args.address2, args.max_depth, args.max_threads, args.log_file, not args.quiet)
