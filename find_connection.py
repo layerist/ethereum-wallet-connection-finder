@@ -1,37 +1,29 @@
 import os
 import time
 import json
-import requests
-from requests import Session
-from requests.exceptions import RequestException, Timeout
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+import logging
 from typing import List, Optional, Set, Tuple
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from requests import Session, RequestException, Timeout
 
-# Constants
+# Configuration
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "YOUR_API_KEY")
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/api"
 REQUEST_TIMEOUT = 10
 
-# Use a session to reuse TCP connections
+# Logging setup
+logging.basicConfig(
+    format='[%(asctime)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    level=logging.INFO
+)
+
 session = Session()
 
-def log_message(message: str, log: Optional[List[str]] = None, verbose: bool = True) -> None:
+def fetch_transactions(address: str, retries: int = 3, delay: int = 1) -> List[dict]:
     """
-    Print and/or store a timestamped log message.
-    """
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    full_message = f"[{timestamp}] {message}"
-    if verbose:
-        print(full_message)
-    if log is not None:
-        log.append(full_message)
-
-@lru_cache(maxsize=1000)
-def get_transactions(address: str, retries: int = 3, delay: int = 1) -> List[dict]:
-    """
-    Fetch transactions for a given Ethereum address with retry and caching.
+    Fetch transactions for a given Ethereum address with retries and exponential backoff.
     """
     params = {
         "module": "account",
@@ -54,47 +46,59 @@ def get_transactions(address: str, retries: int = 3, delay: int = 1) -> List[dic
             elif data.get("message") == "No transactions found":
                 return []
             else:
-                log_message(f"Etherscan error for {address}: {data.get('message')}")
+                logging.warning(f"Etherscan error for {address}: {data.get('message')}")
         except (RequestException, Timeout) as e:
-            log_message(f"Attempt {attempt}/{retries} failed for {address}: {e}")
+            logging.warning(f"Attempt {attempt}/{retries} failed for {address}: {e}")
             time.sleep(delay)
-            delay *= 2  # Exponential backoff
+            delay *= 2  # exponential backoff
 
     return []
 
-def find_connection(
-    address1: str,
-    address2: str,
-    max_depth: int = 3,
+def find_connection_bfs(
+    start_address: str,
+    target_address: str,
+    max_depth: int,
     log: Optional[List[str]] = None
 ) -> bool:
     """
-    Use BFS to find a transaction path from address1 to address2.
+    Perform a BFS to find if a transaction path exists from start_address to target_address.
     """
-    address1, address2 = address1.lower(), address2.lower()
+    start_address, target_address = start_address.lower(), target_address.lower()
     visited: Set[str] = set()
-    queue: deque[Tuple[str, int]] = deque([(address1, 0)])
+    queue: deque[Tuple[str, int]] = deque([(start_address, 0)])
 
     while queue:
         current_address, depth = queue.popleft()
-        if depth >= max_depth or current_address in visited:
+        if current_address in visited or depth > max_depth:
             continue
 
         visited.add(current_address)
-        log_message(f"Exploring {current_address} at depth {depth}", log)
+        msg = f"Exploring {current_address} at depth {depth}"
+        logging.info(msg)
+        if log is not None:
+            log.append(msg)
 
-        transactions = get_transactions(current_address)
-        log_message(f"→ Found {len(transactions)} transactions", log)
+        transactions = fetch_transactions(current_address)
+        msg = f"→ Found {len(transactions)} transactions"
+        logging.info(msg)
+        if log is not None:
+            log.append(msg)
 
         for tx in transactions:
             to_address = tx.get("to", "").lower()
             if not to_address or to_address in visited:
                 continue
 
-            log_message(f"Checking tx {tx['hash']} → {to_address}", log)
+            msg = f"Checking tx {tx['hash']} → {to_address}"
+            logging.info(msg)
+            if log is not None:
+                log.append(msg)
 
-            if to_address == address2:
-                log_message(f"✔ Connection found via tx {tx['hash']}", log)
+            if to_address == target_address:
+                msg = f"✔ Connection found via tx {tx['hash']}"
+                logging.info(msg)
+                if log is not None:
+                    log.append(msg)
                 return True
 
             queue.append((to_address, depth + 1))
@@ -110,19 +114,21 @@ def main(
     verbose: bool = True
 ) -> None:
     """
-    Search for a transaction connection between two Ethereum addresses.
+    Search for a transaction-based connection between two Ethereum addresses.
     """
-    log: List[str] = []
-    log_message(f"🔍 Searching connection from {address1} to {address2}", log, verbose)
+    if not verbose:
+        logging.getLogger().setLevel(logging.WARNING)
 
-    with ThreadPoolExecutor(max_threads) as executor:
-        future = executor.submit(find_connection, address1, address2, max_depth, log)
+    log: List[str] = []
+    logging.info(f"🔍 Searching for a connection from {address1} to {address2}")
+
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        future = executor.submit(find_connection_bfs, address1, address2, max_depth, log)
         connection_found = future.result()
 
-    if connection_found:
-        log_message("🎉 Connection found!", log, verbose)
-    else:
-        log_message("❌ No connection found.", log, verbose)
+    result_msg = "🎉 Connection found!" if connection_found else "❌ No connection found."
+    logging.info(result_msg)
+    log.append(result_msg)
 
     with open(log_file, "w") as f:
         f.write("\n".join(log))
@@ -130,12 +136,12 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Find transaction connection between two Ethereum addresses.")
-    parser.add_argument("address1", help="Starting Ethereum address")
+    parser = argparse.ArgumentParser(description="Find a transaction connection between two Ethereum addresses.")
+    parser.add_argument("address1", help="Source Ethereum address")
     parser.add_argument("address2", help="Target Ethereum address")
-    parser.add_argument("--max-depth", type=int, default=3, help="Maximum search depth")
-    parser.add_argument("--max-threads", type=int, default=4, help="Maximum number of threads")
-    parser.add_argument("--log-file", default="connection_log.txt", help="Path to log file")
+    parser.add_argument("--max-depth", type=int, default=3, help="Maximum BFS search depth")
+    parser.add_argument("--max-threads", type=int, default=4, help="Number of worker threads")
+    parser.add_argument("--log-file", default="connection_log.txt", help="Path to output log file")
     parser.add_argument("--quiet", action="store_true", help="Suppress console output")
 
     args = parser.parse_args()
