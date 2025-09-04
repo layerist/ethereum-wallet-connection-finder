@@ -14,8 +14,9 @@ ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "YOUR_API_KEY")
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/api"
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 3
-RETRY_BACKOFF = 2  # exponential factor
+RETRY_BACKOFF = 2  # exponential backoff factor
 MAX_POOL_CONNECTIONS = 10
+CACHE_ENABLED = True
 
 # =========================
 # Logging
@@ -51,29 +52,34 @@ class Transaction(TypedDict):
 # Shared session with retries
 # =========================
 def create_session() -> Session:
-    s = Session()
+    """Create a shared requests.Session with retry logic."""
+    session = Session()
     retry_strategy = Retry(
         total=MAX_RETRIES,
         backoff_factor=RETRY_BACKOFF,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_maxsize=MAX_POOL_CONNECTIONS)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_maxsize=MAX_POOL_CONNECTIONS
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 session = create_session()
 transaction_cache: Dict[str, List[Transaction]] = {}
 
 # =========================
-# Main function
+# Fetch function
 # =========================
 def fetch_transactions(
     address: str,
     retries: int = MAX_RETRIES,
     delay: float = 1.0,
-    session_obj: Optional[Session] = None
+    session_obj: Optional[Session] = None,
+    use_cache: bool = CACHE_ENABLED
 ) -> List[Transaction]:
     """
     Fetch all normal transactions for a given Ethereum address using the Etherscan API.
@@ -81,14 +87,16 @@ def fetch_transactions(
     Args:
         address (str): Ethereum address to query.
         retries (int): Retry attempts on failure.
-        delay (float): Initial delay between retries.
+        delay (float): Initial delay between retries (will grow exponentially).
         session_obj (Optional[Session]): Custom requests.Session.
+        use_cache (bool): Whether to use cached results.
 
     Returns:
-        List[Transaction]: List of transaction dictionaries.
+        List[Transaction]: List of transactions (possibly empty).
     """
     address = address.lower()
-    if address in transaction_cache:
+
+    if use_cache and address in transaction_cache:
         return transaction_cache[address]
 
     sess = session_obj or session
@@ -113,26 +121,33 @@ def fetch_transactions(
 
             if status == "1":
                 transactions: List[Transaction] = data.get("result", [])
-                transaction_cache[address] = transactions
+                if use_cache:
+                    transaction_cache[address] = transactions
                 return transactions
 
-            elif "no transactions found" in message:
-                transaction_cache[address] = []
+            if "no transactions found" in message:
+                if use_cache:
+                    transaction_cache[address] = []
                 return []
 
-            elif "rate limit" in message or "too many requests" in message:
+            if "rate limit" in message or "too many requests" in message:
                 retry_after = int(response.headers.get("Retry-After", delay))
-                logger.warning(f"Rate limit hit for {address[:10]}... Retrying in {retry_after}s...")
+                logger.warning(
+                    f"Rate limit hit for {address[:10]}... "
+                    f"Retrying in {retry_after}s (attempt {attempt}/{retries})"
+                )
                 time.sleep(retry_after)
                 delay *= RETRY_BACKOFF
                 continue
 
-            else:
-                logger.error(f"Unexpected response for {address[:10]}...: {data}")
-                break
+            logger.error(f"Unexpected response for {address[:10]}...: {data}")
+            break
 
         except (Timeout, HTTPError) as e:
-            logger.warning(f"[{attempt}/{retries}] Timeout/HTTP error for {address[:10]}...: {e}. Retrying in {delay}s...")
+            logger.warning(
+                f"[{attempt}/{retries}] Timeout/HTTP error for {address[:10]}...: {e}. "
+                f"Retrying in {delay}s..."
+            )
             time.sleep(delay)
             delay *= RETRY_BACKOFF
 
