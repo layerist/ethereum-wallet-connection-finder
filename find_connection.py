@@ -21,7 +21,7 @@ class Config:
     retry_backoff: float = 2.0
     max_pool_connections: int = 10
     cache_enabled: bool = True
-    cache_ttl: Optional[int] = 600  # seconds; None = infinite
+    cache_ttl: Optional[int] = 600  # seconds; None = no expiration
 
 
 CONFIG = Config()
@@ -65,6 +65,22 @@ class CacheEntry(TypedDict):
 
 
 # ==============================================================
+# Utils
+# ==============================================================
+def normalize_address(addr: str) -> str:
+    """Normalize and validate Ethereum address."""
+    addr = addr.strip().lower()
+    if len(addr) != 42 or not addr.startswith("0x"):
+        raise ValueError(f"Invalid Ethereum address: {addr}")
+    return addr
+
+
+def short(addr: str) -> str:
+    """Shorten address for logs."""
+    return addr[:10] + "..."
+
+
+# ==============================================================
 # Session Factory with Retry Logic
 # ==============================================================
 def create_session() -> Session:
@@ -76,10 +92,12 @@ def create_session() -> Session:
         allowed_methods=["GET"],
         raise_on_status=False,
     )
+
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
         pool_maxsize=CONFIG.max_pool_connections,
     )
+
     sess = Session()
     sess.mount("https://", adapter)
     sess.mount("http://", adapter)
@@ -94,7 +112,6 @@ transaction_cache: Dict[str, CacheEntry] = {}
 # Caching Helpers
 # ==============================================================
 def _get_cached_transactions(address: str) -> Optional[List[Transaction]]:
-    """Return cached transactions if available and not expired."""
     if not CONFIG.cache_enabled:
         return None
 
@@ -107,16 +124,14 @@ def _get_cached_transactions(address: str) -> Optional[List[Transaction]]:
 
     age = time.monotonic() - entry["timestamp"]
     if age < CONFIG.cache_ttl:
-        logger.debug(f"[{address[:10]}...] Cache hit ({age:.1f}s old)")
+        logger.debug(f"{short(address)} cache hit ({age:.1f}s old)")
         return entry["data"]
 
-    # Expired cache
     transaction_cache.pop(address, None)
     return None
 
 
 def _cache_transactions(address: str, data: List[Transaction]) -> None:
-    """Cache fetched transactions."""
     if CONFIG.cache_enabled:
         transaction_cache[address] = {
             "data": data,
@@ -135,22 +150,20 @@ def fetch_transactions(
     use_cache: bool = CONFIG.cache_enabled,
 ) -> List[Transaction]:
     """
-    Fetch all normal Ethereum transactions for a given address via Etherscan API.
-
-    Args:
-        address: Ethereum wallet address.
-        retries: Max retry attempts.
-        delay: Initial delay between retries in seconds.
-        session_obj: Custom `requests.Session` (optional).
-        use_cache: Whether to use in-memory caching.
+    Fetch Ethereum transactions for an address via the Etherscan API.
 
     Returns:
-        A list of transactions (possibly empty).
+        List of Transaction dicts (possibly empty).
     """
-    address = address.strip().lower()
+    try:
+        address = normalize_address(address)
+    except ValueError as e:
+        logger.error(str(e))
+        return []
+
     sess = session_obj or session
 
-    # Cache check
+    # Cache?
     if use_cache:
         cached = _get_cached_transactions(address)
         if cached is not None:
@@ -175,7 +188,7 @@ def fetch_transactions(
             status = data.get("status")
             message = str(data.get("message", "")).lower()
 
-            # Successful response
+            # Success
             if status == "1":
                 transactions: List[Transaction] = data.get("result", [])
                 _cache_transactions(address, transactions)
@@ -183,37 +196,37 @@ def fetch_transactions(
 
             # No transactions
             if "no transactions" in message:
-                logger.info(f"[{address[:10]}...] No transactions found.")
+                logger.info(f"{short(address)} no transactions.")
                 _cache_transactions(address, [])
                 return []
 
-            # Rate limit
+            # Rate limiting
             if "rate limit" in message or "too many requests" in message:
                 retry_after = int(response.headers.get("Retry-After", delay))
                 logger.warning(
-                    f"[{address[:10]}...] Rate limit hit. "
-                    f"Retrying in {retry_after}s (attempt {attempt}/{retries})"
+                    f"{short(address)} rate limit. Retry in {retry_after}s "
+                    f"(attempt {attempt}/{retries})"
                 )
                 time.sleep(retry_after)
                 delay *= CONFIG.retry_backoff
                 continue
 
-            logger.error(f"[{address[:10]}...] Unexpected API response: {data}")
+            logger.error(f"{short(address)} unexpected API response: {data}")
             break
 
         except (Timeout, HTTPError) as e:
             logger.warning(
-                f"[{address[:10]}...] {type(e).__name__} on attempt {attempt}/{retries}: {e}. "
+                f"{short(address)} {type(e).__name__} attempt {attempt}/{retries}: {e}. "
                 f"Retrying in {delay:.1f}s..."
             )
             time.sleep(delay)
             delay *= CONFIG.retry_backoff
 
         except (RequestException, json.JSONDecodeError) as e:
-            logger.error(f"[{address[:10]}...] Non-retryable error: {e}")
+            logger.error(f"{short(address)} non-retryable error: {e}")
             break
 
-    logger.error(f"[{address[:10]}...] Failed after {retries} attempts.")
+    logger.error(f"{short(address)} failed after {retries} attempts.")
     return []
 
 
@@ -222,5 +235,5 @@ def fetch_transactions(
 # ==============================================================
 if __name__ == "__main__":
     test_address = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae"
-    transactions = fetch_transactions(test_address)
-    logger.info(f"Fetched {len(transactions)} transactions for {test_address[:10]}...")
+    txs = fetch_transactions(test_address)
+    logger.info(f"Fetched {len(txs)} transactions for {short(test_address)}")
