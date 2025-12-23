@@ -1,9 +1,26 @@
+#!/usr/bin/env python3
+"""
+Robust Etherscan transaction fetcher.
+
+Improvements:
+- Thread-safe cache
+- Pagination support (Etherscan 10k tx limit)
+- Exponential backoff with jitter
+- Cleaner retry logic
+- Stronger typing and constants
+"""
+
+from __future__ import annotations
+
 import os
 import time
 import json
+import random
 import logging
-from typing import List, Optional, Dict, TypedDict, Any
+import threading
 from dataclasses import dataclass
+from typing import List, Optional, Dict, TypedDict, Any, Final
+
 from requests import Session, RequestException, Timeout, HTTPError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -16,15 +33,18 @@ from urllib3.util.retry import Retry
 class Config:
     api_key: str = os.getenv("ETHERSCAN_API_KEY", "YOUR_API_KEY")
     base_url: str = "https://api.etherscan.io/api"
+
     request_timeout: int = 10
     max_retries: int = 3
-    retry_backoff: float = 2.0
+    backoff_factor: float = 2.0
     max_pool_connections: int = 10
+
+    page_size: int = 10_000  # Etherscan hard limit
     cache_enabled: bool = True
-    cache_ttl: Optional[int] = 600  # seconds; None = no expiration
+    cache_ttl: Optional[int] = 600  # seconds; None = infinite
 
 
-CONFIG = Config()
+CONFIG: Final = Config()
 
 
 # ==============================================================
@@ -68,28 +88,31 @@ class CacheEntry(TypedDict):
 # Utils
 # ==============================================================
 def normalize_address(addr: str) -> str:
-    """Normalize and validate Ethereum address."""
     addr = addr.strip().lower()
-    if len(addr) != 42 or not addr.startswith("0x"):
+    if not (addr.startswith("0x") and len(addr) == 42):
         raise ValueError(f"Invalid Ethereum address: {addr}")
     return addr
 
 
 def short(addr: str) -> str:
-    """Shorten address for logs."""
-    return addr[:10] + "..."
+    return f"{addr[:8]}…{addr[-4:]}"
+
+
+def backoff_delay(attempt: int) -> float:
+    """Exponential backoff with jitter."""
+    base = CONFIG.backoff_factor ** attempt
+    return base + random.uniform(0.0, 0.5)
 
 
 # ==============================================================
-# Session Factory with Retry Logic
+# Session Factory
 # ==============================================================
 def create_session() -> Session:
-    """Create a `requests.Session` with automatic retries."""
     retry_strategy = Retry(
         total=CONFIG.max_retries,
-        backoff_factor=CONFIG.retry_backoff,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
+        backoff_factor=0,  # handled manually
         raise_on_status=False,
     )
 
@@ -104,56 +127,99 @@ def create_session() -> Session:
     return sess
 
 
-session: Session = create_session()
-transaction_cache: Dict[str, CacheEntry] = {}
+session: Final[Session] = create_session()
 
 
 # ==============================================================
-# Caching Helpers
+# Cache (thread-safe)
 # ==============================================================
-def _get_cached_transactions(address: str) -> Optional[List[Transaction]]:
+_transaction_cache: Dict[str, CacheEntry] = {}
+_cache_lock = threading.Lock()
+
+
+def _get_cached(address: str) -> Optional[List[Transaction]]:
     if not CONFIG.cache_enabled:
         return None
 
-    entry = transaction_cache.get(address)
-    if not entry:
+    with _cache_lock:
+        entry = _transaction_cache.get(address)
+        if not entry:
+            return None
+
+        if CONFIG.cache_ttl is None:
+            return entry["data"]
+
+        age = time.monotonic() - entry["timestamp"]
+        if age < CONFIG.cache_ttl:
+            logger.debug("%s cache hit (%.1fs)", short(address), age)
+            return entry["data"]
+
+        _transaction_cache.pop(address, None)
         return None
 
-    if CONFIG.cache_ttl is None:
-        return entry["data"]
 
-    age = time.monotonic() - entry["timestamp"]
-    if age < CONFIG.cache_ttl:
-        logger.debug(f"{short(address)} cache hit ({age:.1f}s old)")
-        return entry["data"]
+def _set_cache(address: str, data: List[Transaction]) -> None:
+    if not CONFIG.cache_enabled:
+        return
 
-    transaction_cache.pop(address, None)
-    return None
-
-
-def _cache_transactions(address: str, data: List[Transaction]) -> None:
-    if CONFIG.cache_enabled:
-        transaction_cache[address] = {
+    with _cache_lock:
+        _transaction_cache[address] = {
             "data": data,
             "timestamp": time.monotonic(),
         }
 
 
 # ==============================================================
-# Fetch Transactions
+# Core Fetch Logic
 # ==============================================================
+def _fetch_page(
+    sess: Session,
+    address: str,
+    page: int,
+) -> List[Transaction]:
+    params = {
+        "module": "account",
+        "action": "txlist",
+        "address": address,
+        "startblock": 0,
+        "endblock": 99999999,
+        "page": page,
+        "offset": CONFIG.page_size,
+        "sort": "asc",
+        "apikey": CONFIG.api_key,
+    }
+
+    response = sess.get(
+        CONFIG.base_url,
+        params=params,
+        timeout=CONFIG.request_timeout,
+    )
+    response.raise_for_status()
+
+    payload: Dict[str, Any] = response.json()
+    status = payload.get("status")
+    message = str(payload.get("message", "")).lower()
+
+    if status == "1":
+        return payload.get("result", [])
+
+    if "no transactions" in message:
+        return []
+
+    if "rate limit" in message or "too many requests" in message:
+        raise RuntimeError("rate_limit")
+
+    raise RuntimeError(f"unexpected_response: {payload}")
+
+
 def fetch_transactions(
     address: str,
-    retries: int = CONFIG.max_retries,
-    delay: float = 1.0,
+    *,
+    use_cache: bool = True,
     session_obj: Optional[Session] = None,
-    use_cache: bool = CONFIG.cache_enabled,
 ) -> List[Transaction]:
     """
-    Fetch Ethereum transactions for an address via the Etherscan API.
-
-    Returns:
-        List of Transaction dicts (possibly empty).
+    Fetch **all** Ethereum transactions for an address (paginated).
     """
     try:
         address = normalize_address(address)
@@ -161,79 +227,75 @@ def fetch_transactions(
         logger.error(str(e))
         return []
 
-    sess = session_obj or session
-
-    # Cache?
     if use_cache:
-        cached = _get_cached_transactions(address)
+        cached = _get_cached(address)
         if cached is not None:
             return cached
 
-    params = {
-        "module": "account",
-        "action": "txlist",
-        "address": address,
-        "startblock": 0,
-        "endblock": 99999999,
-        "sort": "asc",
-        "apikey": CONFIG.api_key,
-    }
+    sess = session_obj or session
+    all_txs: List[Transaction] = []
 
-    for attempt in range(1, retries + 1):
+    page = 1
+    attempt = 0
+
+    while True:
         try:
-            response = sess.get(CONFIG.base_url, params=params, timeout=CONFIG.request_timeout)
-            response.raise_for_status()
+            txs = _fetch_page(sess, address, page)
+            if not txs:
+                break
 
-            data: Dict[str, Any] = response.json()
-            status = data.get("status")
-            message = str(data.get("message", "")).lower()
+            all_txs.extend(txs)
 
-            # Success
-            if status == "1":
-                transactions: List[Transaction] = data.get("result", [])
-                _cache_transactions(address, transactions)
-                return transactions
+            if len(txs) < CONFIG.page_size:
+                break  # last page
 
-            # No transactions
-            if "no transactions" in message:
-                logger.info(f"{short(address)} no transactions.")
-                _cache_transactions(address, [])
-                return []
+            page += 1
 
-            # Rate limiting
-            if "rate limit" in message or "too many requests" in message:
-                retry_after = int(response.headers.get("Retry-After", delay))
+        except RuntimeError as e:
+            if "rate_limit" in str(e) and attempt < CONFIG.max_retries:
+                delay = backoff_delay(attempt)
+                attempt += 1
                 logger.warning(
-                    f"{short(address)} rate limit. Retry in {retry_after}s "
-                    f"(attempt {attempt}/{retries})"
+                    "%s rate limited, retrying in %.1fs (attempt %d/%d)",
+                    short(address),
+                    delay,
+                    attempt,
+                    CONFIG.max_retries,
                 )
-                time.sleep(retry_after)
-                delay *= CONFIG.retry_backoff
+                time.sleep(delay)
                 continue
-
-            logger.error(f"{short(address)} unexpected API response: {data}")
+            logger.error("%s %s", short(address), e)
             break
 
-        except (Timeout, HTTPError) as e:
+        except (Timeout, HTTPError, RequestException, json.JSONDecodeError) as e:
+            if attempt >= CONFIG.max_retries:
+                logger.error("%s failed after retries: %s", short(address), e)
+                break
+
+            delay = backoff_delay(attempt)
+            attempt += 1
             logger.warning(
-                f"{short(address)} {type(e).__name__} attempt {attempt}/{retries}: {e}. "
-                f"Retrying in {delay:.1f}s..."
+                "%s %s retry in %.1fs (attempt %d/%d)",
+                short(address),
+                type(e).__name__,
+                delay,
+                attempt,
+                CONFIG.max_retries,
             )
             time.sleep(delay)
-            delay *= CONFIG.retry_backoff
 
-        except (RequestException, json.JSONDecodeError) as e:
-            logger.error(f"{short(address)} non-retryable error: {e}")
-            break
-
-    logger.error(f"{short(address)} failed after {retries} attempts.")
-    return []
+    _set_cache(address, all_txs)
+    return all_txs
 
 
 # ==============================================================
-# Example Usage
+# Example
 # ==============================================================
 if __name__ == "__main__":
     test_address = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae"
     txs = fetch_transactions(test_address)
-    logger.info(f"Fetched {len(txs)} transactions for {short(test_address)}")
+    logger.info(
+        "Fetched %d transactions for %s",
+        len(txs),
+        short(test_address),
+    )
