@@ -2,12 +2,12 @@
 """
 Robust Etherscan transaction fetcher.
 
-Improvements:
-- Thread-safe cache
-- Pagination support (Etherscan 10k tx limit)
+Features:
+- Thread-safe in-memory cache with TTL
+- Full pagination support (10k tx/page)
 - Exponential backoff with jitter
-- Cleaner retry logic
-- Stronger typing and constants
+- Explicit error modeling
+- Strong typing and defensive parsing
 """
 
 from __future__ import annotations
@@ -19,10 +19,11 @@ import random
 import logging
 import threading
 from dataclasses import dataclass
-from typing import List, Optional, Dict, TypedDict, Any, Final
+from typing import List, Optional, Dict, TypedDict, Any, Final, Literal
 
-from requests import Session, RequestException, Timeout, HTTPError
+from requests import Session, RequestException
 from requests.adapters import HTTPAdapter
+from requests.exceptions import Timeout, HTTPError
 from urllib3.util.retry import Retry
 
 
@@ -39,9 +40,9 @@ class Config:
     backoff_factor: float = 2.0
     max_pool_connections: int = 10
 
-    page_size: int = 10_000  # Etherscan hard limit
+    page_size: int = 10_000
     cache_enabled: bool = True
-    cache_ttl: Optional[int] = 600  # seconds; None = infinite
+    cache_ttl: Optional[int] = 600  # seconds
 
 
 CONFIG: Final = Config()
@@ -79,13 +80,34 @@ class Transaction(TypedDict, total=False):
     confirmations: str
 
 
+class EtherscanResponse(TypedDict):
+    status: Literal["0", "1"]
+    message: str
+    result: Any
+
+
 class CacheEntry(TypedDict):
     data: List[Transaction]
     timestamp: float
 
 
 # ==============================================================
-# Utils
+# Errors
+# ==============================================================
+class EtherscanError(Exception):
+    pass
+
+
+class RateLimitError(EtherscanError):
+    pass
+
+
+class UnexpectedResponseError(EtherscanError):
+    pass
+
+
+# ==============================================================
+# Utilities
 # ==============================================================
 def normalize_address(addr: str) -> str:
     addr = addr.strip().lower()
@@ -99,9 +121,7 @@ def short(addr: str) -> str:
 
 
 def backoff_delay(attempt: int) -> float:
-    """Exponential backoff with jitter."""
-    base = CONFIG.backoff_factor ** attempt
-    return base + random.uniform(0.0, 0.5)
+    return (CONFIG.backoff_factor ** attempt) + random.uniform(0.0, 0.5)
 
 
 # ==============================================================
@@ -110,9 +130,9 @@ def backoff_delay(attempt: int) -> float:
 def create_session() -> Session:
     retry_strategy = Retry(
         total=CONFIG.max_retries,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        backoff_factor=0,  # handled manually
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        backoff_factor=0,
         raise_on_status=False,
     )
 
@@ -127,7 +147,7 @@ def create_session() -> Session:
     return sess
 
 
-session: Final[Session] = create_session()
+session: Final = create_session()
 
 
 # ==============================================================
@@ -196,20 +216,25 @@ def _fetch_page(
     )
     response.raise_for_status()
 
-    payload: Dict[str, Any] = response.json()
-    status = payload.get("status")
-    message = str(payload.get("message", "")).lower()
+    try:
+        payload: EtherscanResponse = response.json()
+    except json.JSONDecodeError as e:
+        raise UnexpectedResponseError("invalid_json") from e
 
-    if status == "1":
-        return payload.get("result", [])
+    status = payload.get("status")
+    message = payload.get("message", "").lower()
+    result = payload.get("result")
+
+    if status == "1" and isinstance(result, list):
+        return result
 
     if "no transactions" in message:
         return []
 
     if "rate limit" in message or "too many requests" in message:
-        raise RuntimeError("rate_limit")
+        raise RateLimitError(message)
 
-    raise RuntimeError(f"unexpected_response: {payload}")
+    raise UnexpectedResponseError(payload)
 
 
 def fetch_transactions(
@@ -219,7 +244,7 @@ def fetch_transactions(
     session_obj: Optional[Session] = None,
 ) -> List[Transaction]:
     """
-    Fetch **all** Ethereum transactions for an address (paginated).
+    Fetch all Ethereum transactions for an address.
     """
     try:
         address = normalize_address(address)
@@ -241,41 +266,43 @@ def fetch_transactions(
     while True:
         try:
             txs = _fetch_page(sess, address, page)
+            attempt = 0  # reset retry counter on success
+
             if not txs:
                 break
 
             all_txs.extend(txs)
 
             if len(txs) < CONFIG.page_size:
-                break  # last page
+                break
 
             page += 1
 
-        except RuntimeError as e:
-            if "rate_limit" in str(e) and attempt < CONFIG.max_retries:
-                delay = backoff_delay(attempt)
-                attempt += 1
-                logger.warning(
-                    "%s rate limited, retrying in %.1fs (attempt %d/%d)",
-                    short(address),
-                    delay,
-                    attempt,
-                    CONFIG.max_retries,
-                )
-                time.sleep(delay)
-                continue
-            logger.error("%s %s", short(address), e)
-            break
-
-        except (Timeout, HTTPError, RequestException, json.JSONDecodeError) as e:
+        except RateLimitError:
             if attempt >= CONFIG.max_retries:
-                logger.error("%s failed after retries: %s", short(address), e)
+                logger.error("%s rate limit exceeded", short(address))
                 break
 
             delay = backoff_delay(attempt)
             attempt += 1
             logger.warning(
-                "%s %s retry in %.1fs (attempt %d/%d)",
+                "%s rate limited, retrying in %.1fs (%d/%d)",
+                short(address),
+                delay,
+                attempt,
+                CONFIG.max_retries,
+            )
+            time.sleep(delay)
+
+        except (Timeout, HTTPError, RequestException, UnexpectedResponseError) as e:
+            if attempt >= CONFIG.max_retries:
+                logger.error("%s failed: %s", short(address), e)
+                break
+
+            delay = backoff_delay(attempt)
+            attempt += 1
+            logger.warning(
+                "%s %s retry in %.1fs (%d/%d)",
                 short(address),
                 type(e).__name__,
                 delay,
