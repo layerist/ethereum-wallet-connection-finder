@@ -5,7 +5,8 @@ Robust Etherscan transaction fetcher.
 Features:
 - Thread-safe in-memory cache with TTL
 - Full pagination support (10k tx/page)
-- Exponential backoff with jitter
+- Transport-level retries (urllib3)
+- API-level exponential backoff with jitter
 - Explicit error modeling
 - Strong typing and defensive parsing
 """
@@ -36,11 +37,14 @@ class Config:
     base_url: str = "https://api.etherscan.io/api"
 
     request_timeout: int = 10
-    max_retries: int = 3
+    transport_retries: int = 3
+    api_retries: int = 5
     backoff_factor: float = 2.0
-    max_pool_connections: int = 10
+    max_backoff: float = 30.0
 
+    max_pool_connections: int = 10
     page_size: int = 10_000
+
     cache_enabled: bool = True
     cache_ttl: Optional[int] = 600  # seconds
 
@@ -95,15 +99,15 @@ class CacheEntry(TypedDict):
 # Errors
 # ==============================================================
 class EtherscanError(Exception):
-    pass
+    """Base Etherscan error."""
 
 
 class RateLimitError(EtherscanError):
-    pass
+    """API rate limit reached."""
 
 
 class UnexpectedResponseError(EtherscanError):
-    pass
+    """Malformed or unexpected API response."""
 
 
 # ==============================================================
@@ -121,7 +125,9 @@ def short(addr: str) -> str:
 
 
 def backoff_delay(attempt: int) -> float:
-    return (CONFIG.backoff_factor ** attempt) + random.uniform(0.0, 0.5)
+    base = CONFIG.backoff_factor ** attempt
+    jitter = random.uniform(0.0, 0.5)
+    return min(base + jitter, CONFIG.max_backoff)
 
 
 # ==============================================================
@@ -129,10 +135,10 @@ def backoff_delay(attempt: int) -> float:
 # ==============================================================
 def create_session() -> Session:
     retry_strategy = Retry(
-        total=CONFIG.max_retries,
+        total=CONFIG.transport_retries,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
-        backoff_factor=0,
+        backoff_factor=0,  # handled manually
         raise_on_status=False,
     )
 
@@ -147,7 +153,7 @@ def create_session() -> Session:
     return sess
 
 
-session: Final = create_session()
+_SESSION: Final = create_session()
 
 
 # ==============================================================
@@ -157,12 +163,12 @@ _transaction_cache: Dict[str, CacheEntry] = {}
 _cache_lock = threading.Lock()
 
 
-def _get_cached(address: str) -> Optional[List[Transaction]]:
+def _get_cached(key: str) -> Optional[List[Transaction]]:
     if not CONFIG.cache_enabled:
         return None
 
     with _cache_lock:
-        entry = _transaction_cache.get(address)
+        entry = _transaction_cache.get(key)
         if not entry:
             return None
 
@@ -171,19 +177,19 @@ def _get_cached(address: str) -> Optional[List[Transaction]]:
 
         age = time.monotonic() - entry["timestamp"]
         if age < CONFIG.cache_ttl:
-            logger.debug("%s cache hit (%.1fs)", short(address), age)
+            logger.debug("%s cache hit (%.1fs)", key, age)
             return entry["data"]
 
-        _transaction_cache.pop(address, None)
+        _transaction_cache.pop(key, None)
         return None
 
 
-def _set_cache(address: str, data: List[Transaction]) -> None:
+def _set_cache(key: str, data: List[Transaction]) -> None:
     if not CONFIG.cache_enabled:
         return
 
     with _cache_lock:
-        _transaction_cache[address] = {
+        _transaction_cache[key] = {
             "data": data,
             "timestamp": time.monotonic(),
         }
@@ -219,13 +225,15 @@ def _fetch_page(
     try:
         payload: EtherscanResponse = response.json()
     except json.JSONDecodeError as e:
-        raise UnexpectedResponseError("invalid_json") from e
+        raise UnexpectedResponseError("Invalid JSON response") from e
 
     status = payload.get("status")
-    message = payload.get("message", "").lower()
+    message = str(payload.get("message", "")).lower()
     result = payload.get("result")
 
-    if status == "1" and isinstance(result, list):
+    if status == "1":
+        if not isinstance(result, list):
+            raise UnexpectedResponseError("Result is not a list")
         return result
 
     if "no transactions" in message:
@@ -252,12 +260,14 @@ def fetch_transactions(
         logger.error(str(e))
         return []
 
+    cache_key = f"txlist:{address}"
+
     if use_cache:
-        cached = _get_cached(address)
+        cached = _get_cached(cache_key)
         if cached is not None:
             return cached
 
-    sess = session_obj or session
+    sess = session_obj or _SESSION
     all_txs: List[Transaction] = []
 
     page = 1
@@ -266,21 +276,27 @@ def fetch_transactions(
     while True:
         try:
             txs = _fetch_page(sess, address, page)
-            attempt = 0  # reset retry counter on success
+            attempt = 0
 
             if not txs:
                 break
 
             all_txs.extend(txs)
+            logger.debug(
+                "%s page %d fetched (%d txs)",
+                short(address),
+                page,
+                len(txs),
+            )
 
             if len(txs) < CONFIG.page_size:
                 break
 
             page += 1
 
-        except RateLimitError:
-            if attempt >= CONFIG.max_retries:
-                logger.error("%s rate limit exceeded", short(address))
+        except RateLimitError as e:
+            if attempt >= CONFIG.api_retries:
+                logger.error("%s rate limit exhausted: %s", short(address), e)
                 break
 
             delay = backoff_delay(attempt)
@@ -290,28 +306,28 @@ def fetch_transactions(
                 short(address),
                 delay,
                 attempt,
-                CONFIG.max_retries,
+                CONFIG.api_retries,
             )
             time.sleep(delay)
 
         except (Timeout, HTTPError, RequestException, UnexpectedResponseError) as e:
-            if attempt >= CONFIG.max_retries:
-                logger.error("%s failed: %s", short(address), e)
+            if attempt >= CONFIG.api_retries:
+                logger.error("%s failed permanently: %s", short(address), e)
                 break
 
             delay = backoff_delay(attempt)
             attempt += 1
             logger.warning(
-                "%s %s retry in %.1fs (%d/%d)",
+                "%s %s, retry in %.1fs (%d/%d)",
                 short(address),
                 type(e).__name__,
                 delay,
                 attempt,
-                CONFIG.max_retries,
+                CONFIG.api_retries,
             )
             time.sleep(delay)
 
-    _set_cache(address, all_txs)
+    _set_cache(cache_key, all_txs)
     return all_txs
 
 
