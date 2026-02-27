@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Robust Etherscan transaction fetcher.
+Production-grade Etherscan transaction fetcher.
 
-Features:
-- Thread-safe in-memory cache with TTL
-- Full pagination support (10k tx/page)
-- Transport-level retries (urllib3)
-- API-level exponential backoff with jitter
-- Explicit error modeling
-- Strong typing and defensive parsing
+Improvements:
+- Strict configuration validation
+- Deterministic exponential backoff with bounded jitter
+- Proper retry accounting per request
+- Optional max page limit (DoS protection)
+- Thread-safe TTL cache
+- Strict response validation
+- Explicit error propagation (no silent failures)
 """
 
 from __future__ import annotations
@@ -31,19 +32,22 @@ from urllib3.util.retry import Retry
 # ==============================================================
 # Configuration
 # ==============================================================
+
 @dataclass(frozen=True)
 class Config:
-    api_key: str = os.getenv("ETHERSCAN_API_KEY", "YOUR_API_KEY")
+    api_key: str = os.getenv("ETHERSCAN_API_KEY", "")
     base_url: str = "https://api.etherscan.io/api"
 
     request_timeout: int = 10
     transport_retries: int = 3
     api_retries: int = 5
-    backoff_factor: float = 2.0
+
+    backoff_base: float = 1.5
     max_backoff: float = 30.0
 
-    max_pool_connections: int = 10
+    max_pool_connections: int = 20
     page_size: int = 10_000
+    max_pages: Optional[int] = None  # Optional safety cap
 
     cache_enabled: bool = True
     cache_ttl: Optional[int] = 600  # seconds
@@ -51,10 +55,14 @@ class Config:
 
 CONFIG: Final = Config()
 
+if not CONFIG.api_key:
+    raise RuntimeError("ETHERSCAN_API_KEY is not set")
+
 
 # ==============================================================
 # Logging
 # ==============================================================
+
 logging.basicConfig(
     format="[%(asctime)s] %(levelname)s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -66,6 +74,7 @@ logger = logging.getLogger("etherscan")
 # ==============================================================
 # Types
 # ==============================================================
+
 class Transaction(TypedDict, total=False):
     blockNumber: str
     timeStamp: str
@@ -98,26 +107,30 @@ class CacheEntry(TypedDict):
 # ==============================================================
 # Errors
 # ==============================================================
+
 class EtherscanError(Exception):
-    """Base Etherscan error."""
+    pass
 
 
 class RateLimitError(EtherscanError):
-    """API rate limit reached."""
+    pass
 
 
 class UnexpectedResponseError(EtherscanError):
-    """Malformed or unexpected API response."""
+    pass
 
 
 # ==============================================================
 # Utilities
 # ==============================================================
+
 def normalize_address(addr: str) -> str:
-    addr = addr.strip().lower()
+    addr = addr.strip()
+
     if not (addr.startswith("0x") and len(addr) == 42):
         raise ValueError(f"Invalid Ethereum address: {addr}")
-    return addr
+
+    return addr.lower()
 
 
 def short(addr: str) -> str:
@@ -125,20 +138,24 @@ def short(addr: str) -> str:
 
 
 def backoff_delay(attempt: int) -> float:
-    base = CONFIG.backoff_factor ** attempt
-    jitter = random.uniform(0.0, 0.5)
-    return min(base + jitter, CONFIG.max_backoff)
+    """
+    Exponential backoff with bounded jitter.
+    """
+    exp = CONFIG.backoff_base ** attempt
+    jitter = random.uniform(0.0, 0.25 * exp)
+    return min(exp + jitter, CONFIG.max_backoff)
 
 
 # ==============================================================
 # Session Factory
 # ==============================================================
+
 def create_session() -> Session:
     retry_strategy = Retry(
         total=CONFIG.transport_retries,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
-        backoff_factor=0,  # handled manually
+        backoff_factor=0,
         raise_on_status=False,
     )
 
@@ -159,6 +176,7 @@ _SESSION: Final = create_session()
 # ==============================================================
 # Cache (thread-safe)
 # ==============================================================
+
 _transaction_cache: Dict[str, CacheEntry] = {}
 _cache_lock = threading.Lock()
 
@@ -198,11 +216,8 @@ def _set_cache(key: str, data: List[Transaction]) -> None:
 # ==============================================================
 # Core Fetch Logic
 # ==============================================================
-def _fetch_page(
-    sess: Session,
-    address: str,
-    page: int,
-) -> List[Transaction]:
+
+def _fetch_page(sess: Session, address: str, page: int) -> List[Transaction]:
     params = {
         "module": "account",
         "action": "txlist",
@@ -227,6 +242,9 @@ def _fetch_page(
     except json.JSONDecodeError as e:
         raise UnexpectedResponseError("Invalid JSON response") from e
 
+    if not isinstance(payload, dict):
+        raise UnexpectedResponseError("Response is not a JSON object")
+
     status = payload.get("status")
     message = str(payload.get("message", "")).lower()
     result = payload.get("result")
@@ -242,7 +260,7 @@ def _fetch_page(
     if "rate limit" in message or "too many requests" in message:
         raise RateLimitError(message)
 
-    raise UnexpectedResponseError(payload)
+    raise UnexpectedResponseError(f"Unexpected API response: {payload}")
 
 
 def fetch_transactions(
@@ -253,13 +271,10 @@ def fetch_transactions(
 ) -> List[Transaction]:
     """
     Fetch all Ethereum transactions for an address.
+    Raises EtherscanError on permanent failure.
     """
-    try:
-        address = normalize_address(address)
-    except ValueError as e:
-        logger.error(str(e))
-        return []
 
+    address = normalize_address(address)
     cache_key = f"txlist:{address}"
 
     if use_cache:
@@ -271,61 +286,52 @@ def fetch_transactions(
     all_txs: List[Transaction] = []
 
     page = 1
-    attempt = 0
 
     while True:
-        try:
-            txs = _fetch_page(sess, address, page)
-            attempt = 0
+        if CONFIG.max_pages and page > CONFIG.max_pages:
+            logger.warning("Max page limit reached (%d)", CONFIG.max_pages)
+            break
 
-            if not txs:
+        for attempt in range(CONFIG.api_retries + 1):
+            try:
+                txs = _fetch_page(sess, address, page)
+
+                if not txs:
+                    _set_cache(cache_key, all_txs)
+                    return all_txs
+
+                all_txs.extend(txs)
+
+                logger.debug(
+                    "%s page %d fetched (%d txs)",
+                    short(address),
+                    page,
+                    len(txs),
+                )
+
+                if len(txs) < CONFIG.page_size:
+                    _set_cache(cache_key, all_txs)
+                    return all_txs
+
+                page += 1
                 break
 
-            all_txs.extend(txs)
-            logger.debug(
-                "%s page %d fetched (%d txs)",
-                short(address),
-                page,
-                len(txs),
-            )
+            except (RateLimitError, Timeout, HTTPError, RequestException, UnexpectedResponseError) as e:
+                if attempt >= CONFIG.api_retries:
+                    raise EtherscanError(
+                        f"{short(address)} failed after {CONFIG.api_retries} retries"
+                    ) from e
 
-            if len(txs) < CONFIG.page_size:
-                break
-
-            page += 1
-
-        except RateLimitError as e:
-            if attempt >= CONFIG.api_retries:
-                logger.error("%s rate limit exhausted: %s", short(address), e)
-                break
-
-            delay = backoff_delay(attempt)
-            attempt += 1
-            logger.warning(
-                "%s rate limited, retrying in %.1fs (%d/%d)",
-                short(address),
-                delay,
-                attempt,
-                CONFIG.api_retries,
-            )
-            time.sleep(delay)
-
-        except (Timeout, HTTPError, RequestException, UnexpectedResponseError) as e:
-            if attempt >= CONFIG.api_retries:
-                logger.error("%s failed permanently: %s", short(address), e)
-                break
-
-            delay = backoff_delay(attempt)
-            attempt += 1
-            logger.warning(
-                "%s %s, retry in %.1fs (%d/%d)",
-                short(address),
-                type(e).__name__,
-                delay,
-                attempt,
-                CONFIG.api_retries,
-            )
-            time.sleep(delay)
+                delay = backoff_delay(attempt)
+                logger.warning(
+                    "%s %s, retry in %.2fs (%d/%d)",
+                    short(address),
+                    type(e).__name__,
+                    delay,
+                    attempt + 1,
+                    CONFIG.api_retries,
+                )
+                time.sleep(delay)
 
     _set_cache(cache_key, all_txs)
     return all_txs
@@ -334,11 +340,16 @@ def fetch_transactions(
 # ==============================================================
 # Example
 # ==============================================================
+
 if __name__ == "__main__":
     test_address = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae"
-    txs = fetch_transactions(test_address)
-    logger.info(
-        "Fetched %d transactions for %s",
-        len(txs),
-        short(test_address),
-    )
+
+    try:
+        txs = fetch_transactions(test_address)
+        logger.info(
+            "Fetched %d transactions for %s",
+            len(txs),
+            short(test_address),
+        )
+    except EtherscanError as e:
+        logger.error("Fatal error: %s", e)
