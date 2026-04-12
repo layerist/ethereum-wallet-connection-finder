@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-High-reliability Etherscan transaction fetcher (production-grade).
+Ultra-reliable Etherscan transaction fetcher (enhanced production version).
 
-Key upgrades:
-- Circuit breaker (prevents API hammering)
-- Global rate limiter (thread-safe)
-- Safer retry separation (transport vs API)
-- Memory-safe TTL + size-limited cache
-- Optional controlled parallel fetching
-- Strict validation
+Major improvements:
+- Parallel page fetching (ThreadPoolExecutor)
+- Thread-local sessions (fix connection contention)
+- Advanced circuit breaker (HALF-OPEN state)
+- Smarter rate limiter (burst-safe token bucket)
+- Deduplication of transactions
+- Optional fail-soft mode (partial results)
+- Strong validation & safer parsing
 """
 
 from __future__ import annotations
@@ -20,8 +21,9 @@ import random
 import logging
 import threading
 from dataclasses import dataclass
-from typing import List, Optional, Dict, TypedDict, Any, Final, Literal
+from typing import List, Optional, Dict, TypedDict, Any, Final, Literal, Set
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from requests import Session, RequestException
 from requests.adapters import HTTPAdapter
@@ -42,16 +44,20 @@ class Config:
     transport_retries: int = 3
     api_retries: int = 5
 
-    backoff_base: float = 1.6
+    backoff_base: float = 1.7
     max_backoff: float = 30.0
 
-    max_pool_connections: int = 25
+    max_pool_connections: int = 50
 
     page_size: int = 10_000
-    max_pages: Optional[int] = 100  # hard safety cap
+    max_pages: Optional[int] = 100
 
-    # rate limit (~5 req/sec free tier)
+    # parallelism
+    max_workers: int = 5
+
+    # rate limit
     requests_per_second: float = 4.5
+    burst_size: int = 5
 
     # cache
     cache_enabled: bool = True
@@ -61,6 +67,9 @@ class Config:
     # circuit breaker
     cb_fail_threshold: int = 5
     cb_reset_timeout: int = 30
+
+    # behavior
+    fail_soft: bool = True  # return partial data instead of crashing
 
 
 CONFIG: Final = Config()
@@ -137,67 +146,78 @@ def backoff(attempt: int) -> float:
 
 
 # ==============================================================
-# Rate Limiter (token bucket)
+# Rate Limiter (burst-safe token bucket)
 # ==============================================================
 
 class RateLimiter:
-    def __init__(self, rate: float):
+    def __init__(self, rate: float, burst: int):
         self.rate = rate
-        self.tokens = rate
+        self.capacity = burst
+        self.tokens = burst
         self.last = time.monotonic()
         self.lock = threading.Lock()
 
     def acquire(self):
-        with self.lock:
-            now = time.monotonic()
-            delta = now - self.last
-            self.tokens = min(self.rate, self.tokens + delta * self.rate)
-            self.last = now
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                delta = now - self.last
+                self.tokens = min(self.capacity, self.tokens + delta * self.rate)
+                self.last = now
 
-            if self.tokens < 1:
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+
                 sleep_time = (1 - self.tokens) / self.rate
-                time.sleep(sleep_time)
-                self.tokens = 0
-            else:
-                self.tokens -= 1
+
+            time.sleep(sleep_time)
 
 
-_RATE_LIMITER = RateLimiter(CONFIG.requests_per_second)
+_RATE_LIMITER = RateLimiter(CONFIG.requests_per_second, CONFIG.burst_size)
 
 
 # ==============================================================
-# Circuit Breaker
+# Circuit Breaker (HALF-OPEN)
 # ==============================================================
 
 class CircuitBreaker:
     def __init__(self):
         self.failures = 0
+        self.state = "CLOSED"
         self.last_fail = 0.0
         self.lock = threading.Lock()
 
     def check(self):
         with self.lock:
-            if self.failures >= CONFIG.cb_fail_threshold:
-                if time.monotonic() - self.last_fail < CONFIG.cb_reset_timeout:
-                    raise CircuitBreakerOpen("Circuit breaker is OPEN")
-                self.failures = 0
+            if self.state == "OPEN":
+                if time.monotonic() - self.last_fail > CONFIG.cb_reset_timeout:
+                    self.state = "HALF_OPEN"
+                else:
+                    raise CircuitBreakerOpen()
 
     def success(self):
         with self.lock:
             self.failures = 0
+            self.state = "CLOSED"
 
     def fail(self):
         with self.lock:
             self.failures += 1
             self.last_fail = time.monotonic()
+            if self.failures >= CONFIG.cb_fail_threshold:
+                self.state = "OPEN"
 
 
 _CB = CircuitBreaker()
 
 
 # ==============================================================
-# Session
+# Thread-local session
 # ==============================================================
+
+_thread_local = threading.local()
+
 
 def create_session() -> Session:
     retry = Retry(
@@ -218,7 +238,10 @@ def create_session() -> Session:
     return s
 
 
-_SESSION = create_session()
+def get_session() -> Session:
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = create_session()
+    return _thread_local.session
 
 
 # ==============================================================
@@ -252,11 +275,7 @@ def cache_set(key: str, data: List[Transaction]):
         return
 
     with _cache_lock:
-        if key in _cache:
-            _cache.move_to_end(key)
-
         _cache[key] = (time.monotonic(), data)
-
         if len(_cache) > CONFIG.cache_max_size:
             _cache.popitem(last=False)
 
@@ -265,9 +284,11 @@ def cache_set(key: str, data: List[Transaction]):
 # Core
 # ==============================================================
 
-def _fetch_page(session: Session, address: str, page: int) -> List[Transaction]:
+def _fetch_page(address: str, page: int) -> List[Transaction]:
     _CB.check()
     _RATE_LIMITER.acquire()
+
+    session = get_session()
 
     params = {
         "module": "account",
@@ -284,7 +305,7 @@ def _fetch_page(session: Session, address: str, page: int) -> List[Transaction]:
     try:
         resp = session.get(CONFIG.base_url, params=params, timeout=CONFIG.request_timeout)
         resp.raise_for_status()
-    except Exception as e:
+    except Exception:
         _CB.fail()
         raise
 
@@ -324,49 +345,47 @@ def fetch_transactions(address: str) -> List[Transaction]:
     if cached is not None:
         return cached
 
-    session = _SESSION
     all_txs: List[Transaction] = []
+    seen_hashes: Set[str] = set()
 
-    page = 1
-
-    while True:
-        if CONFIG.max_pages and page > CONFIG.max_pages:
-            logger.warning("Max pages reached")
-            break
-
+    def worker(page: int):
         for attempt in range(CONFIG.api_retries + 1):
             try:
-                txs = _fetch_page(session, address, page)
-
-                if not txs:
-                    cache_set(key, all_txs)
-                    return all_txs
-
-                all_txs.extend(txs)
-
-                if len(txs) < CONFIG.page_size:
-                    cache_set(key, all_txs)
-                    return all_txs
-
-                page += 1
-                break
-
-            except (RateLimitError, RequestException, HTTPError, Timeout) as e:
+                return page, _fetch_page(address, page)
+            except Exception as e:
                 if attempt >= CONFIG.api_retries:
-                    raise EtherscanError(f"{short(address)} failed") from e
+                    raise
+                time.sleep(backoff(attempt))
 
-                delay = backoff(attempt)
-                logger.warning(
-                    "%s retry %d/%d in %.2fs (%s)",
-                    short(address),
-                    attempt + 1,
-                    CONFIG.api_retries,
-                    delay,
-                    type(e).__name__,
-                )
-                time.sleep(delay)
+    with ThreadPoolExecutor(max_workers=CONFIG.max_workers) as executor:
+        futures = {
+            executor.submit(worker, page): page
+            for page in range(1, CONFIG.max_pages + 1)
+        }
 
+        for future in as_completed(futures):
+            page = futures[future]
+
+            try:
+                _, txs = future.result()
+            except Exception as e:
+                logger.warning("Page %d failed: %s", page, e)
+                if not CONFIG.fail_soft:
+                    raise
+                continue
+
+            if not txs:
+                continue
+
+            for tx in txs:
+                h = tx.get("hash")
+                if h and h not in seen_hashes:
+                    seen_hashes.add(h)
+                    all_txs.append(tx)
+
+    all_txs.sort(key=lambda x: int(x.get("blockNumber", "0")))
     cache_set(key, all_txs)
+
     return all_txs
 
 
