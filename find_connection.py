@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Production-grade Etherscan transaction fetcher (optimized + adaptive).
+Production-grade Etherscan transaction fetcher
+High-performance + adaptive + safe
 
-Key upgrades:
-- Progressive pagination (auto-stop on empty pages)
-- Adaptive concurrency (reduces workers on rate limit)
-- Retry queue with priority
-- Better sorting (block + timestamp)
-- Safer validation
+Features
+--------
+- True concurrent pagination
+- Adaptive concurrency on rate limits
+- Retry priority queue
+- Progressive page discovery
+- Consecutive empty-page stop logic
+- Thread-local HTTP sessions
+- Connection pooling
+- TTL LRU cache
+- Graceful shutdown
+- Stable deterministic sorting
+- Memory-efficient deduplication
 """
 
 from __future__ import annotations
@@ -16,44 +24,61 @@ import os
 import time
 import json
 import random
+import signal
 import logging
 import threading
-from dataclasses import dataclass
-from typing import List, Optional, Dict, TypedDict, Any, Final, Set
-from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor, Future
 
+from dataclasses import dataclass
+from typing import TypedDict, List, Dict, Set, Final
+from collections import OrderedDict, deque
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    wait,
+    FIRST_COMPLETED,
+    Future,
+)
+
+import requests
 from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# ==============================================================
+# ============================================================
 # CONFIG
-# ==============================================================
+# ============================================================
 
 @dataclass(frozen=True)
 class Config:
     api_key: str = os.getenv("ETHERSCAN_API_KEY", "")
     base_url: str = "https://api.etherscan.io/api"
 
-    timeout: int = 10
-    transport_retries: int = 3
-    api_retries: int = 4
+    timeout: int = 15
+
+    transport_retries: int = 2
+    api_retries: int = 5
 
     page_size: int = 10_000
-    max_pages: int = 1000
+    max_pages: int = 100_000
 
-    initial_workers: int = 5
+    initial_workers: int = 4
+    max_workers: int = 8
     min_workers: int = 1
 
     requests_per_second: float = 4.5
     burst: int = 5
 
+    retry_backoff_cap: int = 30
+
     cache_ttl: int = 600
     cache_size: int = 1000
 
     fail_soft: bool = True
+
+    # stop after N consecutive empty pages
+    empty_page_threshold: int = 3
+
+    log_progress_every: int = 10
 
 
 CONFIG: Final = Config()
@@ -62,20 +87,21 @@ if not CONFIG.api_key:
     raise RuntimeError("ETHERSCAN_API_KEY not set")
 
 
-# ==============================================================
+# ============================================================
 # LOGGING
-# ==============================================================
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s | %(message)s",
 )
+
 log = logging.getLogger("etherscan")
 
 
-# ==============================================================
+# ============================================================
 # TYPES
-# ==============================================================
+# ============================================================
 
 class Transaction(TypedDict, total=False):
     blockNumber: str
@@ -83,11 +109,27 @@ class Transaction(TypedDict, total=False):
     hash: str
 
 
-# ==============================================================
-# RATE LIMITER
-# ==============================================================
+# ============================================================
+# GLOBAL STOP FLAG
+# ============================================================
 
-class RateLimiter:
+shutdown_event = threading.Event()
+
+
+def signal_handler(sig, frame):
+    log.warning("Shutdown requested...")
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ============================================================
+# RATE LIMITER
+# ============================================================
+
+class TokenBucket:
     def __init__(self, rate: float, burst: int):
         self.rate = rate
         self.capacity = burst
@@ -96,103 +138,158 @@ class RateLimiter:
         self.lock = threading.Lock()
 
     def acquire(self):
-        while True:
+        while not shutdown_event.is_set():
+
             with self.lock:
                 now = time.monotonic()
+
                 delta = now - self.last
-                self.tokens = min(self.capacity, self.tokens + delta * self.rate)
                 self.last = now
+
+                self.tokens = min(
+                    self.capacity,
+                    self.tokens + delta * self.rate
+                )
 
                 if self.tokens >= 1:
                     self.tokens -= 1
                     return
 
-                sleep = (1 - self.tokens) / self.rate
+                sleep_for = (
+                    (1 - self.tokens) / self.rate
+                )
 
-            time.sleep(sleep)
+            time.sleep(sleep_for)
 
 
-RL = RateLimiter(CONFIG.requests_per_second, CONFIG.burst)
+RL = TokenBucket(
+    CONFIG.requests_per_second,
+    CONFIG.burst,
+)
 
 
-# ==============================================================
-# SESSION (thread-local)
-# ==============================================================
+# ============================================================
+# THREAD LOCAL SESSION
+# ============================================================
 
-_thread = threading.local()
+_thread_local = threading.local()
 
 
 def get_session() -> Session:
-    if hasattr(_thread, "s"):
-        return _thread.s
+    if hasattr(_thread_local, "session"):
+        return _thread_local.session
 
     retry = Retry(
         total=CONFIG.transport_retries,
+        backoff_factor=0,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
-        backoff_factor=0,
+        raise_on_status=False,
     )
 
-    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=50)
+    adapter = HTTPAdapter(
+        pool_connections=100,
+        pool_maxsize=100,
+        max_retries=retry,
+    )
 
-    s = Session()
-    s.mount("https://", adapter)
+    session = Session()
 
-    _thread.s = s
-    return s
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Connection": "keep-alive",
+        "Accept": "application/json",
+    })
+
+    _thread_local.session = session
+    return session
 
 
-# ==============================================================
+# ============================================================
 # CACHE
-# ==============================================================
+# ============================================================
 
-_cache: OrderedDict[str, tuple[float, List[Transaction]]] = OrderedDict()
+_cache: OrderedDict[
+    str,
+    tuple[float, List[Transaction]]
+] = OrderedDict()
+
 _cache_lock = threading.Lock()
 
 
 def cache_get(key: str):
     with _cache_lock:
-        v = _cache.get(key)
-        if not v:
+
+        item = _cache.get(key)
+
+        if item is None:
             return None
 
-        ts, data = v
+        ts, data = item
+
         if time.monotonic() - ts > CONFIG.cache_ttl:
             _cache.pop(key, None)
             return None
 
         _cache.move_to_end(key)
+
         return data
 
 
-def cache_set(key: str, val):
+def cache_set(key: str, value):
     with _cache_lock:
-        _cache[key] = (time.monotonic(), val)
+
+        _cache[key] = (
+            time.monotonic(),
+            value,
+        )
+
         if len(_cache) > CONFIG.cache_size:
             _cache.popitem(last=False)
 
 
-# ==============================================================
+# ============================================================
 # HELPERS
-# ==============================================================
+# ============================================================
 
-def normalize(addr: str) -> str:
-    addr = addr.strip().lower()
-    if not addr.startswith("0x") or len(addr) != 42:
+def normalize_address(address: str) -> str:
+    address = address.strip().lower()
+
+    if (
+        not address.startswith("0x")
+        or len(address) != 42
+    ):
         raise ValueError("Invalid address")
-    return addr
+
+    return address
 
 
-def backoff(attempt: int):
-    base = 1.5 ** attempt
-    return min(base + random.random(), 20)
+def backoff(attempt: int) -> float:
+    base = 2 ** attempt
+    jitter = random.random()
+
+    return min(
+        base + jitter,
+        CONFIG.retry_backoff_cap,
+    )
 
 
-# ==============================================================
+# ============================================================
 # FETCH PAGE
-# ==============================================================
+# ============================================================
 
-def fetch_page(address: str, page: int):
+class RateLimitError(Exception):
+    pass
+
+
+def fetch_page(
+    address: str,
+    page: int,
+) -> List[Transaction]:
+
     RL.acquire()
 
     params = {
@@ -205,136 +302,344 @@ def fetch_page(address: str, page: int):
         "apikey": CONFIG.api_key,
     }
 
-    s = get_session()
-    r = s.get(CONFIG.base_url, params=params, timeout=CONFIG.timeout)
+    session = get_session()
 
-    data = r.json()
+    try:
+        response = session.get(
+            CONFIG.base_url,
+            params=params,
+            timeout=CONFIG.timeout,
+        )
 
-    if data["status"] == "1":
-        return data["result"]
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"network_error: {e}"
+        )
 
-    msg = data.get("message", "").lower()
+    if response.status_code == 429:
+        raise RateLimitError()
 
-    if "no transactions" in msg:
+    try:
+        data = response.json()
+
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            "invalid_json"
+        )
+
+    status = data.get("status")
+    message = (
+        data.get("message", "")
+        .lower()
+        .strip()
+    )
+
+    result = data.get("result")
+
+    if status == "1":
+        return result
+
+    if (
+        "no transactions found"
+        in message
+    ):
         return []
 
-    if "rate limit" in msg:
-        raise RuntimeError("rate_limit")
+    if (
+        "rate limit" in message
+        or "max rate limit" in message
+    ):
+        raise RateLimitError()
 
-    raise RuntimeError(msg)
+    raise RuntimeError(
+        f"api_error: {message}"
+    )
 
 
-# ==============================================================
+# ============================================================
+# WORKER
+# ============================================================
+
+def page_worker(
+    address: str,
+    page: int,
+):
+    for attempt in range(
+        CONFIG.api_retries
+    ):
+
+        if shutdown_event.is_set():
+            raise RuntimeError(
+                "shutdown"
+            )
+
+        try:
+            txs = fetch_page(
+                address,
+                page,
+            )
+
+            return page, txs
+
+        except RateLimitError:
+            raise
+
+        except Exception:
+
+            sleep_time = backoff(
+                attempt
+            )
+
+            time.sleep(
+                sleep_time
+            )
+
+    raise RuntimeError(
+        f"page_failed:{page}"
+    )
+
+
+# ============================================================
 # MAIN
-# ==============================================================
+# ============================================================
 
-def fetch_transactions(address: str) -> List[Transaction]:
-    address = normalize(address)
+def fetch_transactions(
+    address: str
+) -> List[Transaction]:
+
+    address = normalize_address(
+        address
+    )
 
     cache_key = f"tx:{address}"
-    cached = cache_get(cache_key)
-    if cached:
+
+    cached = cache_get(
+        cache_key
+    )
+
+    if cached is not None:
         return cached
 
-    results: List[Transaction] = []
-    seen: Set[str] = set()
+    seen_hashes: Set[str] = set()
+    results: List[
+        Transaction
+    ] = []
 
-    workers = CONFIG.initial_workers
-    page_queue = deque([1])
+    current_workers = (
+        CONFIG.initial_workers
+    )
+
     retry_queue = deque()
+    active: Dict[
+        Future,
+        int
+    ] = {}
 
-    active_futures: Dict[Future, int] = {}
-    executor = ThreadPoolExecutor(max_workers=workers)
+    next_page = 1
+    empty_pages = 0
+    pages_processed = 0
 
-    stop = False
-    last_page_seen = False
+    executor = ThreadPoolExecutor(
+        max_workers=current_workers
+    )
 
     def submit(page: int):
-        f = executor.submit(worker, page)
-        active_futures[f] = page
+        if (
+            shutdown_event.is_set()
+            or page
+            > CONFIG.max_pages
+        ):
+            return
 
-    def worker(page: int):
-        for attempt in range(CONFIG.api_retries):
-            try:
-                return page, fetch_page(address, page)
-            except Exception as e:
-                if "rate_limit" in str(e):
-                    raise
-                time.sleep(backoff(attempt))
-        raise RuntimeError("max retries")
+        future = executor.submit(
+            page_worker,
+            address,
+            page,
+        )
 
-    submit(1)
+        active[
+            future
+        ] = page
 
-    while active_futures:
-        done = []
-        for f in list(active_futures):
-            if f.done():
-                done.append(f)
+    # warmup batch
+    for _ in range(
+        current_workers * 2
+    ):
+        submit(next_page)
+        next_page += 1
 
-        for f in done:
-            page = active_futures.pop(f)
+    try:
 
-            try:
-                page, txs = f.result()
+        while active:
 
-                if not txs:
-                    last_page_seen = True
-                    continue
+            done, _ = wait(
+                active.keys(),
+                return_when=FIRST_COMPLETED,
+            )
 
-                for tx in txs:
-                    h = tx.get("hash")
-                    if h and h not in seen:
-                        seen.add(h)
-                        results.append(tx)
+            for future in done:
 
-                # schedule next page ONLY if still valid
-                if not last_page_seen:
-                    next_page = page + 1
-                    if next_page <= CONFIG.max_pages:
-                        submit(next_page)
+                page = active.pop(
+                    future
+                )
 
-            except Exception as e:
-                if "rate_limit" in str(e):
-                    log.warning("Rate limit hit → reducing workers")
-                    workers = max(CONFIG.min_workers, workers - 1)
-                    executor._max_workers = workers
-                    retry_queue.append(page)
-                    time.sleep(1)
-                else:
-                    if CONFIG.fail_soft:
-                        log.warning("Page %d failed: %s", page, e)
+                try:
+                    _, txs = (
+                        future.result()
+                    )
+
+                    pages_processed += 1
+
+                    if not txs:
+                        empty_pages += 1
+                    else:
+                        empty_pages = 0
+
+                        for tx in txs:
+                            tx_hash = tx.get(
+                                "hash"
+                            )
+
+                            if (
+                                tx_hash
+                                and tx_hash
+                                not in seen_hashes
+                            ):
+                                seen_hashes.add(
+                                    tx_hash
+                                )
+                                results.append(
+                                    tx
+                                )
+
+                    if (
+                        pages_processed
+                        % CONFIG.log_progress_every
+                        == 0
+                    ):
+                        log.info(
+                            "Pages=%d | txs=%d | workers=%d",
+                            pages_processed,
+                            len(results),
+                            current_workers,
+                        )
+
+                except RateLimitError:
+
+                    log.warning(
+                        "Rate limit hit "
+                        "(workers=%d)",
+                        current_workers,
+                    )
+
+                    retry_queue.appendleft(
+                        page
+                    )
+
+                    current_workers = max(
+                        CONFIG.min_workers,
+                        current_workers - 1,
+                    )
+
+                    time.sleep(
+                        random.uniform(
+                            1.5,
+                            3.0,
+                        )
+                    )
+
+                except Exception as e:
+
+                    if (
+                        CONFIG.fail_soft
+                    ):
+                        log.warning(
+                            "Page %d failed: %s",
+                            page,
+                            e,
+                        )
                     else:
                         raise
 
-        # retry failed pages
-        while retry_queue and len(active_futures) < workers:
-            submit(retry_queue.popleft())
+            if (
+                empty_pages
+                >= CONFIG.empty_page_threshold
+            ):
+                break
 
-        time.sleep(0.01)
+            while (
+                retry_queue
+                and len(active)
+                < current_workers
+            ):
+                submit(
+                    retry_queue.popleft()
+                )
 
-    executor.shutdown(wait=True)
+            while (
+                len(active)
+                < current_workers * 2
+            ):
+                submit(next_page)
+                next_page += 1
 
-    # better sorting
+    finally:
+        executor.shutdown(
+            wait=True,
+            cancel_futures=True,
+        )
+
     results.sort(
-        key=lambda x: (
-            int(x.get("blockNumber", 0)),
-            int(x.get("timeStamp", 0)),
-            x.get("hash", ""),
+        key=lambda tx: (
+            int(
+                tx.get(
+                    "blockNumber",
+                    0,
+                )
+            ),
+            int(
+                tx.get(
+                    "timeStamp",
+                    0,
+                )
+            ),
+            tx.get(
+                "hash",
+                "",
+            ),
         )
     )
 
-    cache_set(cache_key, results)
+    cache_set(
+        cache_key,
+        results,
+    )
+
+    log.info(
+        "Finished: %d txs "
+        "from %d pages",
+        len(results),
+        pages_processed,
+    )
 
     return results
 
 
-# ==============================================================
+# ============================================================
 # RUN
-# ==============================================================
+# ============================================================
 
 if __name__ == "__main__":
-    addr = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae"
 
-    txs = fetch_transactions(addr)
+    address = (
+        "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae"
+    )
 
-    log.info("Fetched %d transactions", len(txs))
+    txs = fetch_transactions(
+        address
+    )
+
+    log.info(
+        "Fetched %d transactions",
+        len(txs),
+    )
