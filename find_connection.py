@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable Etherscan V2 history fetcher.
+Reliable Etherscan V2 history fetcher (v4).
 
 Main upgrades vs a basic txlist downloader:
 - Etherscan V2 endpoint support: /v2/api + chainid.
@@ -48,9 +48,11 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from email.utils import parsedate_to_datetime
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import requests
@@ -156,9 +158,10 @@ class Config:
     min_split_block_span: int = env_int("ETHERSCAN_MIN_SPLIT_BLOCK_SPAN", 1, minimum=1)
     max_single_block_pages: int = env_int("ETHERSCAN_MAX_SINGLE_BLOCK_PAGES", 200, minimum=1)
     log_progress_every: int = env_int("ETHERSCAN_LOG_PROGRESS_EVERY", 25, minimum=1)
+    max_range_requeues: int = env_int("ETHERSCAN_MAX_RANGE_REQUEUES", 5, minimum=0)
 
     proxy: str = env_str("ETHERSCAN_PROXY", "")
-    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/3.0")
+    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/4.0")
 
 
 CONFIG = Config()
@@ -232,7 +235,7 @@ class TokenBucket:
 
                 sleep_for = (1.0 - self.tokens) / self.rate
 
-            time.sleep(min(max(sleep_for, 0.01), 1.0))
+            interruptible_sleep(min(max(sleep_for, 0.01), 1.0))
 
         raise RuntimeError("shutdown")
 
@@ -343,14 +346,27 @@ def full_jitter_backoff(attempt: int, cap: float) -> float:
     return min(random.uniform(0.0, 2.0 ** attempt), cap)
 
 
+def interruptible_sleep(seconds: float) -> None:
+    """Sleep while still reacting quickly to Ctrl+C/SIGTERM."""
+    if seconds <= 0:
+        return
+    if shutdown_event.wait(timeout=seconds):
+        raise RuntimeError("shutdown")
+
+
 def retry_after_seconds(response: requests.Response) -> Optional[float]:
+    """Parse Retry-After as either delta-seconds or an HTTP date."""
     raw = response.headers.get("Retry-After")
     if not raw:
         return None
     try:
         return max(0.0, float(raw))
     except ValueError:
-        return None
+        try:
+            target = parsedate_to_datetime(raw)
+            return max(0.0, target.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def tx_sort_key(tx: Mapping[str, Any]) -> Tuple[int, int, int, str]:
@@ -415,7 +431,9 @@ def validate_config(config: Config) -> None:
     if config.initial_workers > config.max_workers:
         raise ValueError("workers must be <= max-workers")
     if config.page_size > 10_000:
-        log.warning("page_size=%d may exceed Etherscan caps; 10000 is usually the safe maximum", config.page_size)
+        raise ValueError("page_size must be <= 10000 for reliable Etherscan pagination")
+    if not config.base_url.lower().startswith(("https://", "http://")):
+        raise ValueError("base_url must start with http:// or https://")
 
 
 # ============================================================
@@ -438,7 +456,7 @@ def etherscan_get(config: Config, limiter: TokenBucket, params: Dict[str, Any]) 
             last_error = f"network_error: {exc}"
             sleep_for = full_jitter_backoff(attempt + 1, config.retry_backoff_cap)
             log.debug("%s; retry in %.2fs", last_error, sleep_for)
-            time.sleep(sleep_for)
+            interruptible_sleep(sleep_for)
             continue
 
         if response.status_code in {429, 500, 502, 503, 504}:
@@ -447,7 +465,7 @@ def etherscan_get(config: Config, limiter: TokenBucket, params: Dict[str, Any]) 
             if sleep_for is None:
                 sleep_for = full_jitter_backoff(attempt + 1, config.retry_backoff_cap)
             log.debug("%s; retry in %.2fs", last_error, sleep_for)
-            time.sleep(sleep_for)
+            interruptible_sleep(sleep_for)
             continue
 
         try:
@@ -471,7 +489,7 @@ def etherscan_get(config: Config, limiter: TokenBucket, params: Dict[str, Any]) 
             last_error = f"api_throttle: {message} | {result}"
             sleep_for = full_jitter_backoff(attempt + 1, config.retry_backoff_cap)
             log.debug("%s; retry in %.2fs", last_error, sleep_for)
-            time.sleep(sleep_for)
+            interruptible_sleep(sleep_for)
             continue
 
         if any(
@@ -512,26 +530,28 @@ def fetch_range_first_page(config: Config, limiter: TokenBucket, address: str, b
     return fetch_range_page(config, limiter, address, start_block, end_block, 1)
 
 
-def fetch_single_block_all_pages(
+def fetch_single_block_remaining_pages(
     config: Config,
     limiter: TokenBucket,
     address: str,
     block_number: int,
+    first_page: List[Tx],
 ) -> List[Tx]:
-    all_txs: List[Tx] = []
-    page = 1
+    """Continue pagination for a saturated single block without fetching page 1 twice."""
+    all_txs: List[Tx] = list(first_page)
+    page = 2
     while not shutdown_event.is_set():
-        txs = fetch_range_page(config, limiter, address, block_number, block_number, page)
-        all_txs.extend(txs)
-        if len(txs) < config.page_size:
-            break
-        page += 1
         if page > config.max_single_block_pages:
             raise NonFatalAPIError(
                 f"single_block_page_limit_exceeded: block={block_number}; "
                 f"pages>{config.max_single_block_pages}; increase ETHERSCAN_MAX_SINGLE_BLOCK_PAGES"
             )
-    return all_txs
+        txs = fetch_range_page(config, limiter, address, block_number, block_number, page)
+        all_txs.extend(txs)
+        if len(txs) < config.page_size:
+            return all_txs
+        page += 1
+    raise RuntimeError("shutdown")
 
 
 # ============================================================
@@ -544,7 +564,7 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
 
     cache_key = ":".join(
         [
-            "etherscan-v3",
+            "etherscan-v4",
             config.chain_id,
             config.action,
             address,
@@ -563,6 +583,7 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
     active: Dict[Future[List[Tx]], BlockRange] = {}
     all_txs: List[Tx] = []
     failed_ranges: List[Tuple[BlockRange, str]] = []
+    range_requeues: Dict[BlockRange, int] = {}
 
     workers = min(config.initial_workers, config.max_workers)
     completed_ranges = 0
@@ -602,18 +623,28 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
                 try:
                     txs = future.result()
                 except RateLimitError as exc:
+                    attempts = range_requeues.get(block_range, 0) + 1
+                    range_requeues[block_range] = attempts
                     requeued_after_rate_limit += 1
                     workers = max(1, workers - 1)
-                    queued.appendleft(block_range)
-                    log.warning(
-                        "Rate pressure on %d-%d; workers reduced to %d; %s",
-                        start_block,
-                        end_block,
-                        workers,
-                        exc,
-                    )
-                    time.sleep(min(2.0 * requeued_after_rate_limit, 15.0))
-                    continue
+                    if attempts <= config.max_range_requeues:
+                        queued.appendleft(block_range)
+                        log.warning(
+                            "Rate pressure on %d-%d; requeue=%d/%d; workers=%d; %s",
+                            start_block,
+                            end_block,
+                            attempts,
+                            config.max_range_requeues,
+                            workers,
+                            exc,
+                        )
+                        interruptible_sleep(min(2.0 * attempts, 15.0))
+                        continue
+                    if config.fail_soft:
+                        failed_ranges.append((block_range, str(exc)))
+                        log.warning("Range exhausted retries and was skipped: %d-%d | %s", start_block, end_block, exc)
+                        continue
+                    raise
                 except FatalAPIError:
                     shutdown_event.set()
                     raise
@@ -625,17 +656,20 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
                     raise
 
                 completed_ranges += 1
-                span = end_block - start_block
                 saturated = len(txs) >= config.page_size
 
-                if saturated and span >= config.min_split_block_span:
+                if saturated and start_block < end_block:
+                    # A full page is ambiguous: there may be more rows. Split until one block remains.
                     mid = (start_block + end_block) // 2
-                    if mid < end_block:
-                        saturated_ranges += 1
-                        queued.appendleft((mid + 1, end_block))
-                        queued.appendleft((start_block, mid))
-                    else:
-                        all_txs.extend(fetch_single_block_all_pages(config, limiter, address, start_block))
+                    saturated_ranges += 1
+                    queued.appendleft((mid + 1, end_block))
+                    queued.appendleft((start_block, mid))
+                elif saturated:
+                    # Critical correctness case: a single block can itself require multiple pages.
+                    saturated_ranges += 1
+                    all_txs.extend(
+                        fetch_single_block_remaining_pages(config, limiter, address, start_block, txs)
+                    )
                 else:
                     all_txs.extend(txs)
 
@@ -666,7 +700,11 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
         log.warning("Stopped before completion; returning partial result")
 
     result = unique_transactions(all_txs, config.action)
-    cache_set(cache_key, result, config)
+    complete = not shutdown_event.is_set() and not failed_ranges and not queued and not active
+    if complete:
+        cache_set(cache_key, result, config)
+    else:
+        log.warning("Result is partial; it will not be cached")
 
     log.info(
         "Finished: rows=%d unique=%d completed_ranges=%d saturated=%d failed=%d chainid=%s action=%s",
@@ -720,25 +758,47 @@ def collect_csv_fields(rows: Sequence[Tx]) -> List[str]:
 
 
 def write_output(rows: List[Tx], output_path: str, *, jsonl: bool = False, csv_output: bool = False) -> None:
+    """Write atomically so interruption never leaves a half-written destination file."""
+    if jsonl and csv_output:
+        raise ValueError("--jsonl and --csv are mutually exclusive")
+
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: Optional[str] = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temp_name = f.name
+            if csv_output:
+                fields = collect_csv_fields(rows)
+                writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            elif jsonl:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+                    f.write("\n")
+            else:
+                json.dump(rows, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        if temp_name:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
-    if csv_output:
-        fields = collect_csv_fields(rows)
-        with path.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-    elif jsonl:
-        with path.open("w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-                f.write("\n")
-    else:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2, sort_keys=True)
-
-    log.info("Saved: %s", path)
+    log.info("Saved atomically: %s", path)
 
 
 # ============================================================
@@ -772,10 +832,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--fail-soft", action="store_true", default=CONFIG.fail_soft, help="Skip failed ranges instead of aborting")
     parser.add_argument("--strict", action="store_true", help="Abort on first failed range; overrides --fail-soft/env")
     parser.add_argument("--no-cache", action="store_true", help="Disable in-process TTL cache")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.jsonl and args.csv:
+        parser.error("--jsonl and --csv are mutually exclusive")
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    shutdown_event.clear()
     args = parse_args(argv)
 
     config = replace(
