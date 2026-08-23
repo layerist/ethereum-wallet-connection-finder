@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable Etherscan V2 history fetcher (v4).
+Reliable Etherscan V2 history fetcher (v5).
 
 Main upgrades vs a basic txlist downloader:
 - Etherscan V2 endpoint support: /v2/api + chainid.
@@ -10,6 +10,8 @@ Main upgrades vs a basic txlist downloader:
 - Block-range splitting when a range hits the API page-size ceiling.
 - Safe single-block pagination for very busy addresses.
 - Thread-local requests.Session with keep-alive and HTTPAdapter pools.
+- Every retry passes through the shared rate limiter (no hidden adapter retries).
+- Non-zero exit status after SIGINT/SIGTERM even when partial output is saved.
 - Optional HTTP(S) proxy support.
 - Deterministic de-duplication and sorting.
 - JSON, JSONL and CSV output.
@@ -17,10 +19,10 @@ Main upgrades vs a basic txlist downloader:
 - Graceful Ctrl+C shutdown with partial-result return.
 
 Examples:
-  python etherscan_tx_fetcher_v3.py 0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae \
+  python etherscan_tx_fetcher_v5.py 0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae \
     --api-key YOUR_KEY --chainid 1 --action txlist --output txs.json
 
-  python etherscan_tx_fetcher_v3.py 0x... --action tokentx --csv --output erc20.csv
+  python etherscan_tx_fetcher_v5.py 0x... --action tokentx --csv --output erc20.csv
 
 Environment:
   ETHERSCAN_API_KEY
@@ -58,7 +60,6 @@ from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence
 import requests
 from requests import Session
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 
 # ============================================================
@@ -161,11 +162,12 @@ class Config:
     max_range_requeues: int = env_int("ETHERSCAN_MAX_RANGE_REQUEUES", 5, minimum=0)
 
     proxy: str = env_str("ETHERSCAN_PROXY", "")
-    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/4.0")
+    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/5.0")
 
 
 CONFIG = Config()
 shutdown_event = threading.Event()
+_shutdown_signal: Optional[int] = None
 
 
 # ============================================================
@@ -173,8 +175,17 @@ shutdown_event = threading.Event()
 # ============================================================
 
 def _signal_handler(signum: int, _frame: object) -> None:
+    global _shutdown_signal
+    _shutdown_signal = signum
     log.warning("Shutdown requested by signal %s", signum)
     shutdown_event.set()
+
+
+def shutdown_exit_code() -> int:
+    """Return conventional non-zero exit status after SIGINT/SIGTERM."""
+    if _shutdown_signal is None:
+        return 0
+    return 128 + int(_shutdown_signal)
 
 
 try:
@@ -248,26 +259,20 @@ _thread_local = threading.local()
 
 
 def get_session(config: Config) -> Session:
+    """Return one keep-alive Session per worker thread.
+
+    Important: urllib3-level retries are intentionally disabled. Every retry must
+    pass through etherscan_get() so the global TokenBucket sees every HTTP attempt.
+    Otherwise adapter-internal retries can silently exceed the configured RPS.
+    """
     session = getattr(_thread_local, "session", None)
     if session is not None:
         return session
 
-    retry = Retry(
-        total=config.transport_retries,
-        connect=config.transport_retries,
-        read=config.transport_retries,
-        status=config.transport_retries,
-        backoff_factor=0.25,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-
     adapter = HTTPAdapter(
         pool_connections=max(config.max_workers * 4, 4),
         pool_maxsize=max(config.max_workers * 4, 4),
-        max_retries=retry,
+        max_retries=0,
     )
 
     session = Session()
@@ -430,6 +435,16 @@ def validate_config(config: Config) -> None:
         raise ValueError("end_block must be >= start_block")
     if config.initial_workers > config.max_workers:
         raise ValueError("workers must be <= max-workers")
+    try:
+        chain_id_int = int(str(config.chain_id).strip())
+    except ValueError:
+        raise ValueError(f"chain_id must be a positive integer, got {config.chain_id!r}") from None
+    if chain_id_int <= 0:
+        raise ValueError(f"chain_id must be > 0, got {chain_id_int}")
+    if config.requests_per_second <= 0:
+        raise ValueError("requests_per_second must be > 0")
+    if config.timeout <= 0:
+        raise ValueError("timeout must be > 0")
     if config.page_size > 10_000:
         raise ValueError("page_size must be <= 10000 for reliable Etherscan pagination")
     if not config.base_url.lower().startswith(("https://", "http://")):
@@ -441,8 +456,15 @@ def validate_config(config: Config) -> None:
 # ============================================================
 
 def etherscan_get(config: Config, limiter: TokenBucket, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute one logical Etherscan request with rate-limited manual retries.
+
+    All network/HTTP/API retries go through TokenBucket.acquire(). This keeps the
+    configured global RPS true even during throttling or provider instability.
+    """
     session = get_session(config)
     last_error = "unknown"
+    network_failures = 0
+    transient_http = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
     for attempt in range(config.api_retries):
         if shutdown_event.is_set():
@@ -453,26 +475,46 @@ def etherscan_get(config: Config, limiter: TokenBucket, params: Dict[str, Any]) 
         try:
             response = session.get(config.base_url, params=params, timeout=config.timeout)
         except requests.RequestException as exc:
+            network_failures += 1
             last_error = f"network_error: {exc}"
-            sleep_for = full_jitter_backoff(attempt + 1, config.retry_backoff_cap)
-            log.debug("%s; retry in %.2fs", last_error, sleep_for)
+            if network_failures > config.transport_retries or attempt + 1 >= config.api_retries:
+                break
+            sleep_for = full_jitter_backoff(network_failures, config.retry_backoff_cap)
+            log.debug(
+                "%s; transport retry %d/%d in %.2fs",
+                last_error,
+                network_failures,
+                config.transport_retries,
+                sleep_for,
+            )
             interruptible_sleep(sleep_for)
             continue
 
-        if response.status_code in {429, 500, 502, 503, 504}:
+        network_failures = 0
+
+        if response.status_code in transient_http:
             last_error = f"http_{response.status_code}"
+            if attempt + 1 >= config.api_retries:
+                break
             sleep_for = retry_after_seconds(response)
             if sleep_for is None:
                 sleep_for = full_jitter_backoff(attempt + 1, config.retry_backoff_cap)
-            log.debug("%s; retry in %.2fs", last_error, sleep_for)
+            log.debug("%s; retry %d/%d in %.2fs", last_error, attempt + 1, config.api_retries, sleep_for)
             interruptible_sleep(sleep_for)
             continue
 
         try:
             data = response.json()
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as exc:
             snippet = response.text[:250].replace("\n", " ")
-            raise NonFatalAPIError(f"invalid_json: http={response.status_code}; body={snippet!r}") from exc
+            raise NonFatalAPIError(
+                f"invalid_json: http={response.status_code}; body={snippet!r}"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise NonFatalAPIError(
+                f"unexpected_payload_type: http={response.status_code}; type={type(data).__name__}"
+            )
 
         status = str(data.get("status", "")).strip()
         message = str(data.get("message", "")).strip()
@@ -482,13 +524,26 @@ def etherscan_get(config: Config, limiter: TokenBucket, params: Dict[str, Any]) 
         if status == "1":
             return data
 
-        if "no transactions found" in haystack:
+        if any(x in haystack for x in ("no transactions found", "no records found")):
             return {"status": "1", "message": "OK", "result": []}
 
-        if any(x in haystack for x in ("rate limit", "max rate limit", "temporarily unavailable", "timeout")):
-            last_error = f"api_throttle: {message} | {result}"
-            sleep_for = full_jitter_backoff(attempt + 1, config.retry_backoff_cap)
-            log.debug("%s; retry in %.2fs", last_error, sleep_for)
+        if any(
+            x in haystack
+            for x in (
+                "rate limit",
+                "max rate limit",
+                "temporarily unavailable",
+                "timeout",
+                "server too busy",
+            )
+        ):
+            last_error = f"api_transient: {message} | {result}"
+            if attempt + 1 >= config.api_retries:
+                break
+            sleep_for = retry_after_seconds(response)
+            if sleep_for is None:
+                sleep_for = full_jitter_backoff(attempt + 1, config.retry_backoff_cap)
+            log.debug("%s; retry %d/%d in %.2fs", last_error, attempt + 1, config.api_retries, sleep_for)
             interruptible_sleep(sleep_for)
             continue
 
@@ -500,13 +555,17 @@ def etherscan_get(config: Config, limiter: TokenBucket, params: Dict[str, Any]) 
                 "deprecated v1 endpoint",
                 "invalid action",
                 "missing required parameter",
+                "invalid address format",
             )
         ):
-            raise FatalAPIError(f"fatal_api_error: {message} | {result}")
+            raise FatalAPIError(f"fatal_api_error: http={response.status_code}; {message} | {result}")
+
+        if response.status_code >= 400:
+            raise NonFatalAPIError(f"http_api_error: http={response.status_code}; {message} | {result}")
 
         raise NonFatalAPIError(f"api_error: http={response.status_code}; {message} | {result}")
 
-    raise RateLimitError(f"retries_exhausted: {last_error}")
+    raise RateLimitError(f"retries_exhausted after {config.api_retries} attempts: {last_error}")
 
 
 def fetch_range_page(
@@ -530,6 +589,31 @@ def fetch_range_first_page(config: Config, limiter: TokenBucket, address: str, b
     return fetch_range_page(config, limiter, address, start_block, end_block, 1)
 
 
+def fetch_range_remaining_pages(
+    config: Config,
+    limiter: TokenBucket,
+    address: str,
+    start_block: int,
+    end_block: int,
+    first_page: List[Tx],
+) -> List[Tx]:
+    """Continue pagination for a range without fetching page 1 twice."""
+    all_txs: List[Tx] = list(first_page)
+    page = 2
+    while not shutdown_event.is_set():
+        if page > config.max_single_block_pages:
+            raise NonFatalAPIError(
+                f"range_page_limit_exceeded: blocks={start_block}-{end_block}; "
+                f"pages>{config.max_single_block_pages}; increase ETHERSCAN_MAX_SINGLE_BLOCK_PAGES"
+            )
+        txs = fetch_range_page(config, limiter, address, start_block, end_block, page)
+        all_txs.extend(txs)
+        if len(txs) < config.page_size:
+            return all_txs
+        page += 1
+    raise RuntimeError("shutdown")
+
+
 def fetch_single_block_remaining_pages(
     config: Config,
     limiter: TokenBucket,
@@ -537,21 +621,9 @@ def fetch_single_block_remaining_pages(
     block_number: int,
     first_page: List[Tx],
 ) -> List[Tx]:
-    """Continue pagination for a saturated single block without fetching page 1 twice."""
-    all_txs: List[Tx] = list(first_page)
-    page = 2
-    while not shutdown_event.is_set():
-        if page > config.max_single_block_pages:
-            raise NonFatalAPIError(
-                f"single_block_page_limit_exceeded: block={block_number}; "
-                f"pages>{config.max_single_block_pages}; increase ETHERSCAN_MAX_SINGLE_BLOCK_PAGES"
-            )
-        txs = fetch_range_page(config, limiter, address, block_number, block_number, page)
-        all_txs.extend(txs)
-        if len(txs) < config.page_size:
-            return all_txs
-        page += 1
-    raise RuntimeError("shutdown")
+    return fetch_range_remaining_pages(
+        config, limiter, address, block_number, block_number, first_page
+    )
 
 
 # ============================================================
@@ -564,7 +636,8 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
 
     cache_key = ":".join(
         [
-            "etherscan-v4",
+            "etherscan-v5",
+            config.base_url.rstrip("/").lower(),
             config.chain_id,
             config.action,
             address,
@@ -588,7 +661,7 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
     workers = min(config.initial_workers, config.max_workers)
     completed_ranges = 0
     saturated_ranges = 0
-    requeued_after_rate_limit = 0
+    successes_since_rate_limit = 0
 
     def submit(executor: ThreadPoolExecutor, block_range: BlockRange) -> None:
         future = executor.submit(fetch_range_first_page, config, limiter, address, block_range)
@@ -625,7 +698,7 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
                 except RateLimitError as exc:
                     attempts = range_requeues.get(block_range, 0) + 1
                     range_requeues[block_range] = attempts
-                    requeued_after_rate_limit += 1
+                    successes_since_rate_limit = 0
                     workers = max(1, workers - 1)
                     if attempts <= config.max_range_requeues:
                         queued.appendleft(block_range)
@@ -656,20 +729,27 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
                     raise
 
                 completed_ranges += 1
+                successes_since_rate_limit += 1
                 saturated = len(txs) >= config.page_size
 
-                if saturated and start_block < end_block:
-                    # A full page is ambiguous: there may be more rows. Split until one block remains.
-                    mid = (start_block + end_block) // 2
+                if saturated:
                     saturated_ranges += 1
-                    queued.appendleft((mid + 1, end_block))
-                    queued.appendleft((start_block, mid))
-                elif saturated:
-                    # Critical correctness case: a single block can itself require multiple pages.
-                    saturated_ranges += 1
-                    all_txs.extend(
-                        fetch_single_block_remaining_pages(config, limiter, address, start_block, txs)
-                    )
+                    span = end_block - start_block + 1
+                    if start_block < end_block and span > config.min_split_block_span:
+                        # A full page is ambiguous: there may be more rows. Split the block
+                        # interval and re-query both halves; duplicates are removed later.
+                        mid = (start_block + end_block) // 2
+                        queued.appendleft((mid + 1, end_block))
+                        queued.appendleft((start_block, mid))
+                    else:
+                        # Once the range is too small to split further, paginate it. This
+                        # preserves correctness for a single extremely busy block and also
+                        # finally gives ETHERSCAN_MIN_SPLIT_BLOCK_SPAN real semantics.
+                        all_txs.extend(
+                            fetch_range_remaining_pages(
+                                config, limiter, address, start_block, end_block, txs
+                            )
+                        )
                 else:
                     all_txs.extend(txs)
 
@@ -687,11 +767,17 @@ def fetch_transactions(address: str, config: Config = CONFIG) -> List[Tx]:
                         len(failed_ranges),
                     )
 
-            # Restore concurrency gradually. RPS limiter remains the real safety gate.
-            if workers < config.max_workers and queued and requeued_after_rate_limit == 0:
+            # Restore concurrency only after a few successful ranges. The token bucket
+            # remains the hard RPS gate; this worker adaptation reduces pressure after
+            # repeated throttling instead of bouncing back immediately.
+            recovery_successes = 3
+            if (
+                workers < config.max_workers
+                and queued
+                and successes_since_rate_limit >= recovery_successes
+            ):
                 workers += 1
-            elif requeued_after_rate_limit > 0 and completed_ranges % max(config.log_progress_every, 1) == 0:
-                requeued_after_rate_limit = 0
+                successes_since_rate_limit = 0
 
             while queued and len(active) < workers:
                 submit(executor, queued.popleft())
@@ -839,7 +925,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    global _shutdown_signal
     shutdown_event.clear()
+    _shutdown_signal = None
     args = parse_args(argv)
 
     config = replace(
@@ -871,7 +959,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for row in rows if args.jsonl else [rows]:
             print(json.dumps(row, ensure_ascii=False, indent=None if args.jsonl else 2, sort_keys=True))
 
-    return 0
+    return shutdown_exit_code()
 
 
 if __name__ == "__main__":
