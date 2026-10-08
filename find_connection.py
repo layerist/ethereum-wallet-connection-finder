@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable Etherscan V2 history fetcher (v6).
+Reliable Etherscan V2 history fetcher (v7).
 
 Highlights:
 - Etherscan V2 endpoint support: /v2/api + chainid.
@@ -19,10 +19,10 @@ Highlights:
 - In-process TTL/LRU cache only stores complete results.
 
 Examples:
-  python etherscan_tx_fetcher_v6.py 0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae \
+  python etherscan_tx_fetcher_v7.py 0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae \
     --api-key YOUR_KEY --chainid 1 --action txlist --output txs.json
 
-  python etherscan_tx_fetcher_v6.py 0x... --action tokentx --csv --output erc20.csv
+  python etherscan_tx_fetcher_v7.py 0x... --action tokentx --csv --output erc20.csv
 
 Environment:
   ETHERSCAN_API_KEY
@@ -183,7 +183,7 @@ class Config:
     log_progress_every: int = env_int("ETHERSCAN_LOG_PROGRESS_EVERY", 25, minimum=1)
 
     proxy: str = env_str("ETHERSCAN_PROXY", "")
-    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/6.0")
+    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/7.0")
 
 
 CONFIG = Config()
@@ -370,6 +370,7 @@ def get_session(config: Config) -> Session:
     )
 
     if config.proxy:
+        session.trust_env = False
         session.proxies.update({"http": config.proxy, "https": config.proxy})
 
     _thread_local.session = session
@@ -453,7 +454,10 @@ def retry_after_seconds(response: requests.Response, cap: float) -> Optional[flo
 
     delay: Optional[float]
     try:
-        delay = max(0.0, float(raw))
+        delay = float(raw)
+        if not math.isfinite(delay):
+            return None
+        delay = max(0.0, delay)
     except ValueError:
         try:
             target = parsedate_to_datetime(raw)
@@ -464,7 +468,7 @@ def retry_after_seconds(response: requests.Response, cap: float) -> Optional[flo
         except (TypeError, ValueError, OverflowError):
             delay = None
 
-    if delay is None:
+    if delay is None or not math.isfinite(delay):
         return None
     return min(delay, cap)
 
@@ -581,6 +585,12 @@ def validate_config(config: Config) -> None:
         raise ValueError("api_retries must be >= 1")
     if config.transport_retries < 0:
         raise ValueError("transport_retries must be >= 0")
+    if config.retry_backoff_cap <= 0 or not math.isfinite(config.retry_backoff_cap):
+        raise ValueError("retry_backoff_cap must be finite and > 0")
+    if config.cache_ttl < 0 or not math.isfinite(config.cache_ttl):
+        raise ValueError("cache_ttl must be finite and >= 0")
+    if config.min_split_block_span < 1 or config.max_range_pages < 1:
+        raise ValueError("split span and max range pages must be >= 1")
     if config.max_retry_after < 0 or not math.isfinite(config.max_retry_after):
         raise ValueError("max_retry_after must be a finite value >= 0")
 
@@ -711,6 +721,8 @@ def etherscan_get(
         haystack = f"{message} {result_text}".lower()
 
         if status == "1":
+            if not isinstance(data.get("result"), list):
+                raise NonFatalAPIError("successful_api_response_has_non_list_result")
             stats.inc("http_successes")
             return data
 
@@ -794,7 +806,9 @@ def fetch_range_page(
             f"unexpected_result_type: {type(result).__name__}; result={str(result)[:500]!r}"
         )
     stats.inc("pages_fetched")
-    return [dict(item) for item in result if isinstance(item, dict)]
+    if any(not isinstance(item, dict) for item in result):
+        raise NonFatalAPIError("unexpected_transaction_item_type: API returned non-object rows")
+    return [dict(item) for item in result]
 
 
 def fetch_range_first_page(
@@ -870,7 +884,7 @@ def fetch_range_remaining_pages(
 def make_cache_key(config: Config, address: str) -> str:
     return ":".join(
         [
-            "etherscan-v6",
+            "etherscan-v7",
             config.base_url.rstrip("/").lower(),
             config.chain_id,
             config.action,
@@ -888,7 +902,7 @@ def fetch_transactions_detailed(address: str, config: Config = CONFIG) -> FetchO
 
     cache_key = make_cache_key(config, address)
     cached = cache_get(cache_key, config)
-    if cached is not None:
+    if cached is not None and not shutdown_event.is_set():
         log.info("Cache hit: %d rows", len(cached))
         return FetchOutcome(rows=cached, complete=True, interrupted=False)
 
@@ -939,7 +953,7 @@ def fetch_transactions_detailed(address: str, config: Config = CONFIG) -> FetchO
             if not done:
                 continue
 
-            for future in done:
+            for future in sorted(done, key=lambda f: active[f]):
                 block_range = active.pop(future)
                 start_block, end_block = block_range
 
