@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Reliable Etherscan V2 history fetcher (v7).
+Reliable Etherscan V2 history fetcher (v8).
 
 Highlights:
 - Etherscan V2 endpoint support: /v2/api + chainid.
 - Normal, internal, ERC-20, ERC-721 and ERC-1155 account actions.
 - Global token-bucket limiter shared by all worker threads and all retries.
-- Retry-After aware retries with capped full-jitter backoff.
+- Retry-After aware retries with capped full-jitter backoff and shared cooldowns.
 - Separate connect/read timeouts.
 - Range splitting on saturated pages, with bounded pagination for unsplittable ranges.
 - Pagination loop/stall detection to avoid silently accepting repeated API pages.
@@ -15,14 +15,14 @@ Highlights:
 - Deterministic de-duplication and sorting.
 - Atomic JSON/JSONL/CSV writes, including directory fsync on POSIX when possible.
 - Strict mode and fail-soft mode with optional machine-readable failure report.
-- Graceful SIGINT/SIGTERM: completed rows are returned/saved and exit status is non-zero.
+- Graceful SIGINT/SIGTERM: completed rows and validated partial pages are preserved.
 - In-process TTL/LRU cache only stores complete results.
 
 Examples:
-  python etherscan_tx_fetcher_v7.py 0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae \
+  python etherscan_tx_fetcher_v8.py 0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae \
     --api-key YOUR_KEY --chainid 1 --action txlist --output txs.json
 
-  python etherscan_tx_fetcher_v7.py 0x... --action tokentx --csv --output erc20.csv
+  python etherscan_tx_fetcher_v8.py 0x... --action tokentx --csv --output erc20.csv
 
 Environment:
   ETHERSCAN_API_KEY
@@ -62,7 +62,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import requests
 from requests import Session
@@ -145,7 +145,6 @@ SUPPORTED_ACTIONS = {
 }
 
 TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
-FATAL_HTTP = {400, 401, 403, 404}
 
 
 @dataclass(frozen=True)
@@ -183,7 +182,7 @@ class Config:
     log_progress_every: int = env_int("ETHERSCAN_LOG_PROGRESS_EVERY", 25, minimum=1)
 
     proxy: str = env_str("ETHERSCAN_PROXY", "")
-    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/7.0")
+    user_agent: str = env_str("ETHERSCAN_USER_AGENT", "etherscan-fetcher/8.0")
 
 
 CONFIG = Config()
@@ -253,11 +252,14 @@ def shutdown_exit_code() -> int:
     return 128 + int(_shutdown_signal)
 
 
-try:
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-except (ValueError, OSError):
-    pass
+def install_signal_handlers() -> None:
+    """Install CLI handlers without overriding host applications on import."""
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(signum, _signal_handler)
+        except (ValueError, OSError):
+            # Libraries may invoke main() outside of the main thread.
+            pass
 
 
 # ============================================================
@@ -300,7 +302,15 @@ class TokenBucket:
         self.capacity = float(burst)
         self.tokens = float(burst)
         self.updated_at = time.monotonic()
+        self.paused_until = 0.0
         self.lock = threading.Lock()
+
+    def pause_for(self, seconds: float) -> None:
+        """Share an API throttle cooldown across all worker threads."""
+        if seconds <= 0:
+            return
+        with self.lock:
+            self.paused_until = max(self.paused_until, time.monotonic() + seconds)
 
     def acquire(self) -> None:
         while True:
@@ -313,11 +323,13 @@ class TokenBucket:
                 self.updated_at = now
                 self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
 
-                if self.tokens >= 1.0:
+                if now < self.paused_until:
+                    sleep_for = self.paused_until - now
+                elif self.tokens >= 1.0:
                     self.tokens -= 1.0
                     return
-
-                sleep_for = (1.0 - self.tokens) / self.rate
+                else:
+                    sleep_for = (1.0 - self.tokens) / self.rate
 
             interruptible_sleep(min(max(sleep_for, 0.01), 1.0))
 
@@ -447,6 +459,23 @@ def interruptible_sleep(seconds: float) -> None:
         raise ShutdownRequested("shutdown requested")
 
 
+def safe_request_error(exc: requests.RequestException, config: Config) -> str:
+    """Avoid leaking API/proxy credentials from exception URLs into logs/reports."""
+    detail = str(exc)
+    proxy_password = urlparse(config.proxy).password if config.proxy else None
+    secrets = (
+        config.api_key,
+        quote_plus(config.api_key),
+        config.proxy,
+        proxy_password,
+        quote_plus(proxy_password) if proxy_password else None,
+    )
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "[REDACTED]")
+    return f"network_error: {type(exc).__name__}: {detail}"
+
+
 def retry_after_seconds(response: requests.Response, cap: float) -> Optional[float]:
     raw = response.headers.get("Retry-After")
     if not raw:
@@ -473,12 +502,20 @@ def retry_after_seconds(response: requests.Response, cap: float) -> Optional[flo
     return min(delay, cap)
 
 
-def tx_sort_key(tx: Mapping[str, Any]) -> Tuple[int, int, int, str, str]:
+def tx_sort_key(tx: Mapping[str, Any]) -> Tuple[int, int, int, Tuple[int, Any], str]:
+    trace = str(tx.get("traceId") or "")
+    components = trace.split("_")
+    # Etherscan trace paths are numeric, so "0_2" precedes "0_10".
+    trace_key: Tuple[int, Any] = (
+        (0, tuple(int(part) for part in components))
+        if all(part.isdecimal() for part in components)
+        else (1, trace)
+    )
     return (
         parse_int(tx.get("blockNumber")),
         parse_int(tx.get("transactionIndex")),
         parse_int(tx.get("logIndex")),
-        str(tx.get("traceId") or ""),
+        trace_key,
         str(tx.get("hash") or tx.get("transactionHash") or ""),
     )
 
@@ -589,8 +626,14 @@ def validate_config(config: Config) -> None:
         raise ValueError("retry_backoff_cap must be finite and > 0")
     if config.cache_ttl < 0 or not math.isfinite(config.cache_ttl):
         raise ValueError("cache_ttl must be finite and >= 0")
+    if config.cache_size < 0:
+        raise ValueError("cache_size must be >= 0")
     if config.min_split_block_span < 1 or config.max_range_pages < 1:
         raise ValueError("split span and max range pages must be >= 1")
+    if config.max_range_requeues < 0:
+        raise ValueError("max_range_requeues must be >= 0")
+    if config.recovery_successes < 1 or config.log_progress_every < 1:
+        raise ValueError("recovery_successes and log_progress_every must be >= 1")
     if config.max_retry_after < 0 or not math.isfinite(config.max_retry_after):
         raise ValueError("max_retry_after must be a finite value >= 0")
 
@@ -652,11 +695,14 @@ def etherscan_get(
                 config.base_url,
                 params=params,
                 timeout=(config.connect_timeout, config.read_timeout),
+                allow_redirects=False,
             )
         except requests.RequestException as exc:
+            if shutdown_event.is_set():
+                raise ShutdownRequested("shutdown requested") from None
             consecutive_transport_failures += 1
             stats.inc("transport_errors")
-            last_error = f"network_error: {exc.__class__.__name__}: {exc}"
+            last_error = safe_request_error(exc, config)
             if (
                 consecutive_transport_failures > config.transport_retries
                 or attempt >= config.api_retries
@@ -675,7 +721,7 @@ def etherscan_get(
 
         consecutive_transport_failures = 0
 
-        if response.status_code in TRANSIENT_HTTP:
+        if response.status_code in TRANSIENT_HTTP or response.status_code >= 500:
             stats.inc("http_transient")
             last_error = f"http_{response.status_code}"
             if attempt >= config.api_retries:
@@ -690,10 +736,15 @@ def etherscan_get(
                 config.api_retries,
                 sleep_for,
             )
-            interruptible_sleep(sleep_for)
+            if response.status_code == 429:
+                limiter.pause_for(sleep_for)
+            else:
+                interruptible_sleep(sleep_for)
             continue
 
-        if response.status_code in FATAL_HTTP:
+        if 300 <= response.status_code < 400:
+            raise FatalAPIError(f"Unexpected HTTP redirect ({response.status_code}); check base_url")
+        if 400 <= response.status_code < 500:
             snippet = response.text[:300].replace("\n", " ")
             raise FatalAPIError(f"HTTP {response.status_code}: {snippet!r}")
 
@@ -755,13 +806,18 @@ def etherscan_get(
                 config.api_retries,
                 sleep_for,
             )
-            interruptible_sleep(sleep_for)
+            if "rate limit" in haystack:
+                limiter.pause_for(sleep_for)
+            else:
+                interruptible_sleep(sleep_for)
             continue
 
         if any(
             text in haystack
             for text in (
                 "invalid api key",
+                "invalid api-key",
+                "free api access is not supported",
                 "missing or unsupported chainid",
                 "deprecated v1 endpoint",
                 "invalid action",
@@ -783,6 +839,8 @@ def etherscan_get(
             f"api_error: http={response.status_code}; {message} | {result_text}"
         )
 
+    if shutdown_event.is_set():
+        raise ShutdownRequested("shutdown requested")
     stats.inc("rate_limit_exhaustions")
     raise RateLimitError(
         f"retries_exhausted after {config.api_retries} attempts: {last_error}"
@@ -805,9 +863,9 @@ def fetch_range_page(
         raise NonFatalAPIError(
             f"unexpected_result_type: {type(result).__name__}; result={str(result)[:500]!r}"
         )
-    stats.inc("pages_fetched")
     if any(not isinstance(item, dict) for item in result):
         raise NonFatalAPIError("unexpected_transaction_item_type: API returned non-object rows")
+    stats.inc("pages_fetched")
     return [dict(item) for item in result]
 
 
@@ -830,9 +888,11 @@ def fetch_range_remaining_pages(
     end_block: int,
     first_page: List[Tx],
     stats: AtomicStats,
+    *,
+    collected: Optional[List[Tx]] = None,
 ) -> List[Tx]:
-    """Continue a saturated range from page 2 with loop/stall protection."""
-    all_txs: List[Tx] = list(first_page)
+    """Continue a saturated range; optionally keep all good pages on failure."""
+    all_txs: List[Tx] = collected if collected is not None else list(first_page)
     seen_fingerprints: Set[str] = {page_fingerprint(first_page, config.action)}
     seen_identities: Set[str] = {tx_identity(tx, config.action) for tx in first_page}
 
@@ -884,8 +944,8 @@ def fetch_range_remaining_pages(
 def make_cache_key(config: Config, address: str) -> str:
     return ":".join(
         [
-            "etherscan-v7",
-            config.base_url.rstrip("/").lower(),
+            "etherscan-v8",
+            config.base_url.rstrip("/"),
             config.chain_id,
             config.action,
             address,
@@ -1012,8 +1072,10 @@ def fetch_transactions_detailed(address: str, config: Config = CONFIG) -> FetchO
                         queued.appendleft((mid + 1, end_block))
                         queued.appendleft((start_block, mid))
                     else:
+                        # Preserve every validated page, not just page one, on errors/signals.
+                        collected = list(txs)
                         try:
-                            paginated = fetch_range_remaining_pages(
+                            fetch_range_remaining_pages(
                                 config,
                                 limiter,
                                 address,
@@ -1021,27 +1083,28 @@ def fetch_transactions_detailed(address: str, config: Config = CONFIG) -> FetchO
                                 end_block,
                                 txs,
                                 stats,
+                                collected=collected,
                             )
                         except ShutdownRequested:
                             shutdown_event.set()
-                            all_txs.extend(txs)
+                            all_txs.extend(collected)
+                            failed_ranges.append(
+                                FailedRange(start_block, end_block, "interrupted_during_pagination")
+                            )
                             continue
                         except Exception as exc:
                             if config.fail_soft:
-                                # Preserve page 1 as known-good partial data, but mark the range incomplete.
-                                all_txs.extend(txs)
+                                all_txs.extend(collected)
                                 failed_ranges.append(FailedRange(start_block, end_block, str(exc)))
                                 log.warning(
-                                    "Pagination failed; preserved first page only: %d-%d | %s",
-                                    start_block,
-                                    end_block,
-                                    exc,
+                                    "Pagination failed; preserved %d validated rows: %d-%d | %s",
+                                    len(collected), start_block, end_block, exc,
                                 )
                                 continue
                             raise
 
                         stats.inc("paginated_ranges")
-                        all_txs.extend(paginated)
+                        all_txs.extend(collected)
                 else:
                     all_txs.extend(txs)
 
@@ -1072,11 +1135,35 @@ def fetch_transactions_detailed(address: str, config: Config = CONFIG) -> FetchO
                 submit(executor, queued.popleft())
 
     finally:
-        if shutdown_event.is_set():
+        interrupted = shutdown_event.is_set()
+        if interrupted:
             for future in active:
                 future.cancel()
-        # Running requests cannot be force-cancelled safely; wait for them to leave requests.get().
+        # Running HTTP calls cannot be force-cancelled; workers check the event between calls.
         executor.shutdown(wait=True, cancel_futures=True)
+        if interrupted:
+            # A request may finish between the last wait() and shutdown(). Recover
+            # its result instead of losing already-fetched data on SIGINT/SIGTERM.
+            for future, block_range in sorted(active.items(), key=lambda item: item[1]):
+                start_block, end_block = block_range
+                if not future.cancelled():
+                    try:
+                        txs = future.result()
+                    except Exception:
+                        pass
+                    else:
+                        all_txs.extend(txs)
+                        if len(txs) < config.page_size:
+                            stats.inc("completed_ranges")
+                            continue
+                failed_ranges.append(
+                    FailedRange(start_block, end_block, "interrupted_before_range_completion")
+                )
+            failed_ranges.extend(
+                FailedRange(start, end, "interrupted_before_range_start")
+                for start, end in queued
+            )
+            active.clear()
 
     if shutdown_event.is_set():
         log.warning("Stopped before completion; returning partial result")
@@ -1373,8 +1460,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global _shutdown_signal
     shutdown_event.clear()
     _shutdown_signal = None
+    install_signal_handlers()
 
     args = parse_args(argv)
+    if args.output and args.failure_report:
+        if Path(args.output).expanduser().resolve() == Path(args.failure_report).expanduser().resolve():
+            raise ValueError("--output and --failure-report must be different files")
     config = build_config_from_args(args)
     outcome = fetch_transactions_detailed(args.address, config)
 
